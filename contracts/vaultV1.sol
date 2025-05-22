@@ -23,13 +23,12 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
     // Fee on profit, in basis points (e.g. 100 = 1%)
     uint16 public feeBps;
     address public feeRecipient;
-    uint[] public apyFeeReceived;
+    uint256[] public apyFeeReceived;
 
     // Fee on deposit (bps, e.g. 59 = 0.59%)
     uint16 public depositFeeBps;
     address public depositFeeRecipient;
-    uint public depositFeeReceived;
-
+    uint256[] public depositFeeReceived;
 
     // Slippage tolerance, in basis points (e.g. 100 = 1%) applied to all adds/removes
     uint16 public slippageBps;
@@ -46,7 +45,7 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
         uint16 newFeeBps,
         address indexed newRecipient
     );
-    event rawDeposit(address indexed user,uint grossLp, uint netLp);
+    event rawDeposit(address indexed user, uint256 grossLp, uint256 netLp);
 
     constructor(
         ERC20 _tokenA,
@@ -73,7 +72,8 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
         octoRouter = _octoRouter;
         depositFeeBps = _depositFeeBps;
         depositFeeRecipient = _feeRecipient;
-        apyFeeReceived = new uint[](2);
+        apyFeeReceived = new uint256[](2);
+        depositFeeReceived = new uint256[](2);
     }
 
     /// @notice Update slippage tolerance (bps)
@@ -83,12 +83,14 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
         slippageBps = _newSlippageBps;
     }
 
-
-    function setDepositFeeParams(uint16 _newDepositFeeBps, address _newRecipient) external onlyOwner {
-    require(_newDepositFeeBps <= 1000, "Max 10% fee");
-    depositFeeBps = _newDepositFeeBps;
-    depositFeeRecipient = _newRecipient;
-}
+    function setDepositFeeParams(
+        uint16 _newDepositFeeBps,
+        address _newRecipient
+    ) external onlyOwner {
+        require(_newDepositFeeBps <= 1000, "Max 10% fee");
+        depositFeeBps = _newDepositFeeBps;
+        depositFeeRecipient = _newRecipient;
+    }
 
     /// @notice Update fee params
     function setFeeParams(uint16 _newFeeBps, address _newRecipient)
@@ -115,9 +117,31 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
         );
 
         IERC20(inputToken).transferFrom(msg.sender, address(this), amountIn);
+        
+        uint256 fee = amountIn.mulDiv(
+            depositFeeBps,
+            10_000,
+            Math.Rounding.Floor
+        );
+        uint256 amountAfterFee = amountIn - fee;
 
-        uint256 half = amountIn / 2;
-        uint256 otherHalf = amountIn - half;
+        // Transfer fee to recipient
+        IERC20(inputToken).transfer(depositFeeRecipient, fee);
+        if(inputToken == address(tokenA) ){
+            depositFeeReceived[0]+=amountAfterFee;
+        }else if(inputToken == address(tokenB)){
+            depositFeeReceived[1]+=amountAfterFee;
+        }
+
+        // Transfer remaining amount to contract
+        // IERC20(inputToken).transferFrom(
+        //     msg.sender,
+        //     address(this),
+        //     amountAfterFee
+        // );
+
+        uint256 half = amountAfterFee / 2;
+        uint256 otherHalf = amountAfterFee - half;
 
         uint256 swapped = _swapHalf(inputToken, half);
 
@@ -136,25 +160,28 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
             amtB.mulDiv(10_000 - slippageBps, 10_000, Math.Rounding.Floor)
         );
 
-        // — deposit fee on LP tokens
-        uint256 netLp = _applyDepositFee(lpReceived);
-
-        shares = previewDeposit(netLp);
+        shares = previewDeposit(lpReceived);
         _mint(receiver, shares);
 
-        userPrincipal[receiver] += netLp;
-        // lpToken.transfer(depositFeeRecipient, depositFeeLp);
+        userPrincipal[receiver] += lpReceived;
 
-        emit Deposit(msg.sender, receiver, netLp, shares);
-        emit rawDeposit(msg.sender,lpReceived, netLp);
+        emit Deposit(msg.sender, receiver, lpReceived, shares);
+        // emit rawDeposit(msg.sender,lpReceived, netLp);
     }
 
-    function _applyDepositFee(uint256 grossLp) internal returns (uint256 netLp) {
-    // compute net and send fee out
-    netLp = grossLp.mulDiv(10_000 - depositFeeBps, 10_000, Math.Rounding.Floor);
-    lpToken.transfer(depositFeeRecipient, grossLp - netLp);
-    depositFeeReceived+=(grossLp - netLp);
-}
+    // function _applyDepositFee(uint256 grossLp)
+    //     internal
+    //     returns (uint256 netLp)
+    // {
+    //     // compute net and send fee out
+    //     netLp = grossLp.mulDiv(
+    //         10_000 - depositFeeBps,
+    //         10_000,
+    //         Math.Rounding.Floor
+    //     );
+    //     lpToken.transfer(depositFeeRecipient, grossLp - netLp);
+    //     depositFeeReceived += (grossLp - netLp);
+    // }
 
     function _swapHalf(address inputToken, uint256 half)
         internal
@@ -194,7 +221,6 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
 
     /// --------------reclaim----------
     //Burn shares, remove liquidity (with slippage), charge fee on profit, and transfer underlyings
-
 
     function reclaim(
         uint256 shares,
@@ -249,8 +275,8 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
             (uint256 feeA, uint256 feeB) = _removeWithSlippage(feeLp);
             tokenA.transfer(feeRecipient, feeA);
             tokenB.transfer(feeRecipient, feeB);
-            apyFeeReceived[0]+=feeA;
-            apyFeeReceived[1]+=feeB;
+            apyFeeReceived[0] += feeA;
+            apyFeeReceived[1] += feeB;
 
             emit FeeTaken(owner, feeA, feeB);
         }
@@ -290,12 +316,10 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
             );
     }
 
-
     //-----------------autocompound------------------
     /// @notice Auto-compound LP tokens, respecting slippage
 
-    
-    function autocompound(uint256 minLpTokens) external nonReentrant {
+    function autocompound() external nonReentrant {
         uint256 lpBalance = lpToken.balanceOf(address(this));
         if (lpBalance == 0) return;
 
@@ -329,6 +353,7 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
             receivedB.mulDiv(10_000 - slippageBps, 10_000, Math.Rounding.Floor)
         );
 
+        uint256 minLpTokens = lpBalance.mulDiv(10_000 - slippageBps, 10_000, Math.Rounding.Floor);
         require(newLpTokens >= minLpTokens, "Slippage too high");
         emit Compounded(newLpTokens, totalAssets());
     }

@@ -4,35 +4,29 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 contract MySwapper {
-    IAggregator public aggregator = IAggregator(payable(0xC995498c22a012353FAE7eCC701810D673E25794));
-
-    function executeSwap(
-        address inputToken,
-        address outputToken,
-        uint256 amount,
-        address[] calldata targets,
-        bytes[] calldata data,
-        uint256 minOut,
-        uint256 deadline
-    ) external payable {
-        // Approve token if not ETH
-        if (inputToken != aggregator.NATIVE_ADDRESS()) {
-            ERC20(inputToken).approve(address(aggregator), amount);
-        }
-
-        aggregator.aggregate{value: msg.value}(
-            inputToken,
-            outputToken,
-            amount,
-            targets,
-            data,
-            msg.sender,
-            minOut,
-            deadline
-        );
-    }
+    function callAggregatorSwap(address aggregator, bytes calldata data) external {
+    (bool success, bytes memory result) = aggregator.call(data);
+    require(success, "Aggregator swap failed");
 }
+function callAggregatorSwapWithValue(address aggregator, bytes calldata data) external payable {
+    (bool success, bytes memory result) = aggregator.call{value: msg.value}(data);
+    require(success, "Aggregator swap failed");
+}
+}
+contract OptimizedSwapper {
+    // address public constant AGGREGATOR = 0xC995498c22a012353FAE7eCC701810D673E25794;
+    IAggregator public immutable aggregator;
+    constructor(IAggregator _aggregator){
+        aggregator=_aggregator;
+    }
+    function callAggregatorSwap( bytes calldata data,uint toknAmnt,address tknAddr) external {
 
+    IERC20(tknAddr).transferFrom(msg.sender,address(this),toknAmnt);
+    IERC20(tknAddr).approve(address(aggregator),toknAmnt);
+    (bool success, bytes memory result) = address(aggregator).call(data);
+
+    require(success, "Aggregator swap failed");
+}}
 
 interface IAggregator {
     // Events
@@ -83,7 +77,7 @@ interface IAggregator {
         address destination,
         uint256 minOutAmount,
         uint256 deadline
-    ) external payable;
+    ) external ;
 
     function batchSetTargetAllowlist(
         address[] calldata targets,
@@ -115,4 +109,12 @@ interface IAggregator {
     ) external;
 
     receive() external payable;
+    fallback() external payable;  // <-- add this line to enable fallback
+}
+
+contract Caller {
+    function callFallbackWithCalldata(address target, bytes calldata data) external payable {
+        (bool success, bytes memory returnData) = target.call{value: msg.value}(data);
+        require(success, "Fallback call failed");
+    }
 }
