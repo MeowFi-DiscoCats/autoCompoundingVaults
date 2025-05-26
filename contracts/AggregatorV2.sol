@@ -8,7 +8,7 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 contract AggregatorV2 is ReentrancyGuard {
     address public native=address(0);
     
-    function aggreagteAndJoin(
+    function aggregateAndJoin(
         address vaultAddr,
         uint amountOut,
         address outputToken,

@@ -8,6 +8,10 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./bubbleFiABI.sol";
 import "./uniswaphelper.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 /// @title BubbleLPVault
 /// @notice ERC4626 vault for Bubble LP tokens, with profit-only redemption fee and configurable slippage
@@ -32,7 +36,7 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
 
     // Slippage tolerance, in basis points (e.g. 100 = 1%) applied to all adds/removes
     uint16 public slippageBps;
-
+  ///meowfi -> bubblfi -> bubblei pool
     // Tracks deposited LP token principal per user
     mapping(address => uint256) private userPrincipal;
     IOctoswapRouter02 public immutable octoRouter;

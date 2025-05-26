@@ -28,38 +28,11 @@ contract OptimizedSwapper {
     require(success, "Aggregator swap failed");
 }}
 
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
 interface IAggregator {
-    // Events
-    event Aggregation(
-        address indexed tokenAddress,
-        address indexed outTokenAddress,
-        uint256 amount,
-        uint256 destinationAmount,
-        uint256 feeAmount
-    );
-    
-    event FeeMultiplierUpdated(uint256 oldFeeMultiplier, uint256 newFeeMultiplier);
-    event FeeReceiverUpdated(address indexed oldFeeReceiver, address indexed newFeeReceiver);
-    event NativeSenderAllowlistUpdated(address indexed sender, bool allowed);
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-    event TargetAllowlistUpdated(address indexed target, bool allowed);
-
-    // Errors
-    error CallFailed(bytes data);
-    error InsufficientOutput();
-    error InvalidAddress();
-    error InvalidAmount();
-    error InvalidArrayLength();
-    error InvalidFeeReceiver();
-    error OwnableInvalidOwner(address owner);
-    error OwnableUnauthorizedAccount(address account);
-    error ReentrancyGuardReentrantCall();
-    error SafeERC20FailedOperation(address token);
-    error TransactionExpired();
-    error TransferFailed();
-    error UnauthorizedTarget();
-
-    // View functions
+    // Read functions
     function NATIVE_ADDRESS() external view returns (address);
     function allowedNativeSenders(address sender) external view returns (bool);
     function allowedTargets(address target) external view returns (bool);
@@ -67,7 +40,7 @@ interface IAggregator {
     function feeReceiver() external view returns (address);
     function owner() external view returns (address);
 
-    // Transaction functions
+    // Write functions
     function aggregate(
         address tokenAddress,
         address outTokenAddress,
@@ -77,44 +50,51 @@ interface IAggregator {
         address destination,
         uint256 minOutAmount,
         uint256 deadline
-    ) external ;
+    ) external payable;
 
     function batchSetTargetAllowlist(
         address[] calldata targets,
         bool[] calldata allowed
     ) external;
 
+    function setAllowedNativeSender(address sender, bool allowed) external;
+    function setFeeMultiplier(uint256 newFeeBps) external;
+    function setFeeReceiver(address newFeeReceiver) external;
+    function setTargetAllowlist(address target, bool allowed) external;
     function renounceOwnership() external;
+    function transferOwnership(address newOwner) external;
 
-    function setAllowedNativeSender(
-        address sender,
+    // Events
+    event Aggregation(
+        address indexed tokenAddress,
+        address indexed outTokenAddress,
+        uint256 amount,
+        uint256 destinationAmount,
+        uint256 feeAmount
+    );
+
+    event FeeMultiplierUpdated(
+        uint256 oldFeeMultiplier,
+        uint256 newFeeMultiplier
+    );
+
+    event FeeReceiverUpdated(
+        address indexed oldFeeReceiver,
+        address indexed newFeeReceiver
+    );
+
+    event NativeSenderAllowlistUpdated(
+        address indexed sender,
         bool allowed
-    ) external;
+    );
 
-    function setFeeMultiplier(
-        uint256 newFeeBps
-    ) external;
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
 
-    function setFeeReceiver(
-        address newFeeReceiver
-    ) external;
-
-    function setTargetAllowlist(
-        address target,
+    event TargetAllowlistUpdated(
+        address indexed target,
         bool allowed
-    ) external;
-
-    function transferOwnership(
-        address newOwner
-    ) external;
-
-    receive() external payable;
-    fallback() external payable;  // <-- add this line to enable fallback
-}
-
-contract Caller {
-    function callFallbackWithCalldata(address target, bytes calldata data) external payable {
-        (bool success, bytes memory returnData) = target.call{value: msg.value}(data);
-        require(success, "Fallback call failed");
-    }
+    );
 }
