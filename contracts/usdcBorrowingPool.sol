@@ -60,12 +60,14 @@ contract USDCBorrowingPoolV2 is
     uint256 public liquidationThreshold; // 70% = 7000 basis points
     uint256 public maxLTV; // 65% = 6500 basis points
     uint256 public liquidationPenalty; // 5% = 500 basis points
-    uint256 public annualInterestRate; // 10% = 1000 basis points
     uint256 public lenderShare; // 80% = 8000 basis points
     uint256 public slippageBPS; // 3% = 300 basis points
     uint256 public protocolFeeRate; // 20% = 2000 basis points (of interest)
+    uint256 public baseRate; // 2% base rate (in basis points)
+    uint256 public multiplier; // 10% multiplier (in basis points)
+    uint256 public jumpMultiplier; // 100% jump multiplier (in basis points)
+    uint256 public kink;
 
-    // Constants
     uint256 public constant LIQUIDATION_THRESHOLD = 7000; // 70%
     uint256 private constant USDC_DECIMALS = 6;
     uint256 private constant ORACLE_DECIMALS = 18; // Oracle returns 18 decimals
@@ -153,6 +155,13 @@ contract USDCBorrowingPoolV2 is
         uint256 timestamp
     );
 
+    event InterestRateModelUpdated(
+        uint256 baseRate,
+        uint256 multiplier,
+        uint256 jumpMultiplier,
+        uint256 kink
+    );
+
     constructor() {
         _disableInitializers();
     }
@@ -195,10 +204,13 @@ contract USDCBorrowingPoolV2 is
         liquidationThreshold = 7000; // 70%
         maxLTV = 6500; // 65%
         liquidationPenalty = 500; // 5%
-        annualInterestRate = 1000; // 10%
         lenderShare = 8000; // 80%
         slippageBPS = 300; // 3%
         protocolFeeRate = 2000; // 20%
+        baseRate = 200; // 2% base rate (in basis points)
+        multiplier = 1000; // 10% multiplier (in basis points)
+        jumpMultiplier = 10000; // 100% jump multiplier (in basis points)
+        kink = 8000;
 
         lastAccrualTime = block.timestamp;
     }
@@ -243,6 +255,55 @@ contract USDCBorrowingPoolV2 is
 
     function setLiquidationEnabled(bool _enabled) external onlyOwner {
         liquidationEnabled = _enabled;
+    }
+
+    /// Get current utilization rate
+    function getUtilizationRate() public view returns (uint256) {
+        if (totalLent == 0) return 0;
+        return
+            totalBorrowed.mulDiv(BASIS_POINTS, totalLent, Math.Rounding.Floor);
+    }
+
+    /// Calculate current borrow rate based on utilization
+    function getBorrowRate() public view returns (uint256) {
+        uint256 utilization = getUtilizationRate();
+
+        if (utilization <= kink) {
+            // Normal rate: baseRate + (utilization * multiplier / 10000)
+            return
+                baseRate +
+                utilization.mulDiv(
+                    multiplier,
+                    BASIS_POINTS,
+                    Math.Rounding.Floor
+                );
+        } else {
+            // Jump rate: baseRate + kink * multiplier + (utilization - kink) * jumpMultiplier
+            uint256 normalRate = baseRate +
+                kink.mulDiv(multiplier, BASIS_POINTS, Math.Rounding.Floor);
+            uint256 excessUtil = utilization - kink;
+            uint256 jumpRate = excessUtil.mulDiv(
+                jumpMultiplier,
+                BASIS_POINTS,
+                Math.Rounding.Floor
+            );
+            return normalRate + jumpRate;
+        }
+    }
+
+    /// Calculate supply rate (what lenders earn)
+    function getSupplyRate() public view returns (uint256) {
+        uint256 utilization = getUtilizationRate();
+        uint256 borrowRate = getBorrowRate();
+
+        // Supply Rate = Borrow Rate * Utilization * (1 - Reserve Factor)
+        uint256 rateToPool = borrowRate.mulDiv(
+            lenderShare,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        return
+            utilization.mulDiv(rateToPool, BASIS_POINTS, Math.Rounding.Floor);
     }
 
     /// Convert USDC (6 decimals) to calculation format (18 decimals)
@@ -820,6 +881,8 @@ contract USDCBorrowingPoolV2 is
     function liquidateMultiple(address[] calldata borrowersToLiquidate)
         external
         nonReentrant
+        whenNotPaused
+        notLiquidationsPaused
     {
         require(liquidationEnabled, "Liquidation is disabled");
         require(borrowersToLiquidate.length > 0, "No borrowers provided");
@@ -956,8 +1019,10 @@ contract USDCBorrowingPoolV2 is
             return position.accruedInterest;
 
         uint256 timeElapsed = block.timestamp - position.lastUpdateTime;
+        uint256 currentBorrowRate = getBorrowRate();
+
         uint256 newInterest = position.borrowedAmount.mulDiv(
-            annualInterestRate * timeElapsed,
+            currentBorrowRate * timeElapsed,
             BASIS_POINTS * 365 days,
             Math.Rounding.Ceil
         );
@@ -975,15 +1040,10 @@ contract USDCBorrowingPoolV2 is
         if (info.depositAmount == 0) return info.accruedInterest;
 
         uint256 timeElapsed = block.timestamp - info.lastUpdateTime;
-        uint256 utilization = totalLent > 0
-            ? totalBorrowed.mulDiv(BASIS_POINTS, totalLent, Math.Rounding.Floor)
-            : 0;
-        uint256 lenderRate = annualInterestRate
-            .mulDiv(utilization, BASIS_POINTS, Math.Rounding.Floor)
-            .mulDiv(lenderShare, BASIS_POINTS, Math.Rounding.Floor);
+        uint256 currentSupplyRate = getSupplyRate();
 
         uint256 newInterest = info.depositAmount.mulDiv(
-            lenderRate * timeElapsed,
+            currentSupplyRate * timeElapsed,
             BASIS_POINTS * 365 days,
             Math.Rounding.Floor
         );
@@ -1011,6 +1071,82 @@ contract USDCBorrowingPoolV2 is
     }
 
     // VIEW FUNCTIONS
+
+    function updateInterestRateModel(
+        uint256 _baseRate,
+        uint256 _multiplier,
+        uint256 _jumpMultiplier,
+        uint256 _kink
+    ) external onlyOwner {
+        require(_kink <= BASIS_POINTS, "Invalid kink");
+        require(_baseRate <= 2000, "Base rate too high"); // Max 20%
+
+        baseRate = _baseRate;
+        multiplier = _multiplier;
+        jumpMultiplier = _jumpMultiplier;
+        kink = _kink;
+
+        emit InterestRateModelUpdated(
+            _baseRate,
+            _multiplier,
+            _jumpMultiplier,
+            _kink
+        );
+    }
+
+    /// Get current rates for display
+    function getCurrentRates()
+        external
+        view
+        returns (
+            uint256 utilization,
+            uint256 borrowRate,
+            uint256 supplyRate
+        )
+    {
+        utilization = getUtilizationRate();
+        borrowRate = getBorrowRate();
+        supplyRate = getSupplyRate();
+    }
+
+    /// Get rate at specific utilization (for frontend curves)
+    function getRateAtUtilization(uint256 utilizationRate)
+        external
+        view
+        returns (uint256 borrowRate, uint256 supplyRate)
+    {
+        // Temporarily calculate rates at given utilization
+        if (utilizationRate <= kink) {
+            borrowRate =
+                baseRate +
+                utilizationRate.mulDiv(
+                    multiplier,
+                    BASIS_POINTS,
+                    Math.Rounding.Floor
+                );
+        } else {
+            uint256 normalRate = baseRate +
+                kink.mulDiv(multiplier, BASIS_POINTS, Math.Rounding.Floor);
+            uint256 excessUtil = utilizationRate - kink;
+            uint256 jumpRate = excessUtil.mulDiv(
+                jumpMultiplier,
+                BASIS_POINTS,
+                Math.Rounding.Floor
+            );
+            borrowRate = normalRate + jumpRate;
+        }
+
+        uint256 rateToPool = borrowRate.mulDiv(
+            lenderShare,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        supplyRate = utilizationRate.mulDiv(
+            rateToPool,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+    }
 
     ///  Get borrower position with current interest
     function getBorrowerPosition(address borrower)
