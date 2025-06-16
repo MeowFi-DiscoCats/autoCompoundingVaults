@@ -9,14 +9,17 @@ contract USDCVaultRegistry is Ownable(msg.sender) {
     address public usdc;
     address public priceFetcher;
     address public pawUSDC;
-    
+
     mapping(string => address) public vaultsByName;
     mapping(address => bool) public isRegisteredVault;
     address[] public registeredVaults;
 
     event VaultRegistered(address indexed vault, string name);
     event VaultUnregistered(address indexed vault, string name);
-    event FactoryUpdated(address indexed oldFactory, address indexed newFactory);
+    event FactoryUpdated(
+        address indexed oldFactory,
+        address indexed newFactory
+    );
     event CoreAddressesUpdated(
         address indexed usdc,
         address indexed priceFetcher,
@@ -52,7 +55,13 @@ contract USDCVaultRegistry is Ownable(msg.sender) {
         uint256 protocolFeeRate,
         uint256 vaultFeeRate,
         uint256 lenderShare,
-        uint256 slippageBPS
+        uint256 slippageBPS,
+        address bubbleVault,
+        address tokenA,
+        address tokenB,
+        address lpToken,
+        address octoRouter,
+        address bubbleRouter
     ) external onlyOwner returns (address) {
         require(vaultsByName[name] == address(0), "Vault name already exists");
 
@@ -61,6 +70,9 @@ contract USDCVaultRegistry is Ownable(msg.sender) {
             usdc,
             priceFetcher,
             pawUSDC,
+            bubbleVault,
+            tokenA,
+            tokenB,
             maxLTV,
             liquidationThreshold,
             liquidationPenalty,
@@ -71,7 +83,10 @@ contract USDCVaultRegistry is Ownable(msg.sender) {
             protocolFeeRate,
             vaultFeeRate,
             lenderShare,
-            slippageBPS
+            slippageBPS,
+            lpToken,
+            octoRouter,
+            bubbleRouter
         );
 
         vaultsByName[name] = vault;
@@ -82,7 +97,10 @@ contract USDCVaultRegistry is Ownable(msg.sender) {
         return vault;
     }
 
-    function registerExistingVault(address vault, string memory name) external onlyOwner {
+    function registerExistingVault(address vault, string memory name)
+        external
+        onlyOwner
+    {
         require(vault != address(0), "Invalid vault");
         require(vaultsByName[name] == address(0), "Vault name already exists");
         require(factory.isVault(vault), "Not a valid vault");
@@ -105,7 +123,9 @@ contract USDCVaultRegistry is Ownable(msg.sender) {
         // Remove from registeredVaults array
         for (uint256 i = 0; i < registeredVaults.length; i++) {
             if (registeredVaults[i] == vault) {
-                registeredVaults[i] = registeredVaults[registeredVaults.length - 1];
+                registeredVaults[i] = registeredVaults[
+                    registeredVaults.length - 1
+                ];
                 registeredVaults.pop();
                 break;
             }
@@ -144,4 +164,4 @@ contract USDCVaultRegistry is Ownable(msg.sender) {
     function getVaultCount() external view returns (uint256) {
         return registeredVaults.length;
     }
-} 
+}
