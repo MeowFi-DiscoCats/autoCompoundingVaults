@@ -12,7 +12,8 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "./vaultV1uups.sol";
 import "./bubbleFiABI.sol";
 import "./uniswaphelper.sol";
-import "./IMonadPriceFetcher.sol";
+import "./interfaces/IMonadPriceFetcher.sol";
+import "./PawUSDC.sol";
 
 contract USDCBorrowingPoolV2 is
     Initializable,
@@ -24,31 +25,47 @@ contract USDCBorrowingPoolV2 is
     using SafeERC20Upgradeable for IERC20Upgradeable;
     using Math for uint256;
 
+    struct VaultConfig {
+        uint256 maxLTV;
+        uint256 liquidationThreshold;
+        uint256 liquidationPenalty;
+        uint256 baseRate;
+        uint256 multiplier;
+        uint256 jumpMultiplier;
+        uint256 kink;
+        bool borrowingEnabled;
+        bool active;
+        uint256 totalLent;
+        uint256 totalBorrowed;
+        uint256 totalCollateral;
+        uint256 protocolFeeRate;
+        uint256 vaultFeeRate;
+        uint256 lenderShare;
+        uint256 slippageBPS;
+        uint256 minBorrowAmount;
+        uint256 minLiquidationAmount;
+    }
+
     struct LenderInfo {
-        uint256 depositAmount; // USDC deposited (6 decimals)
-        uint256 lastUpdateTime; // Last interest calculation
-        uint256 accruedInterest; // Interest earned (6 decimals)
+        uint256 depositAmount;
+        uint256 lastUpdateTime;
+        uint256 accruedInterest;
+        uint256 pawUSDCAmount;
+        uint256 interestIndex;
     }
 
     struct BorrowerPosition {
         uint256 collateralAmount;
-        uint256 borrowedAmount; // USDC borrowed (6 decimals)
-        uint256 lastUpdateTime; // Last interest calculation
-        uint256 accruedInterest; // Interest owed (6 decimals)
-        bool isActive; // Position status
+        uint256 borrowedAmount;
+        uint256 lastUpdateTime;
+        uint256 accruedInterest;
+        bool isActive;
     }
 
-    // Core contracts
-    BubbleLPVault public bubbleVault;
+    PawUSDC public pawUSDC;
     IERC20Upgradeable public usdc;
-    IERC20Upgradeable public tokenA;
-    IERC20Upgradeable public tokenB;
-    IERC20Upgradeable public lpToken;
-    IBubbleV1Router public bubbleRouter;
-    IOctoswapRouter02 public octoRouter;
     IMonadPriceFetcher public priceFetcher;
 
-    // Token addresses - immutable constants
     address public constant USDC_ADDRESS =
         0xf817257fed379853cDe0fa4F97AB987181B1E5Ea;
     address public constant WMON_ADDRESS =
@@ -56,70 +73,99 @@ contract USDCBorrowingPoolV2 is
     address public constant SHMON_ADDRESS =
         0x3a98250F98Dd388C211206983453837C8365BDc1;
 
-    // Protocol parameters - can be updated by owner
-    uint256 public liquidationThreshold; // 70% = 7000 basis points
-    uint256 public maxLTV; // 65% = 6500 basis points
-    uint256 public liquidationPenalty; // 5% = 500 basis points
-    uint256 public lenderShare; // 80% = 8000 basis points
-    uint256 public slippageBPS; // 3% = 300 basis points
-    uint256 public protocolFeeRate; // 20% = 2000 basis points (of interest)
-    uint256 public baseRate; // 2% base rate (in basis points)
-    uint256 public multiplier; // 10% multiplier (in basis points)
-    uint256 public jumpMultiplier; // 100% jump multiplier (in basis points)
-    uint256 public kink;
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant USDC_DECIMALS = 6;
+    uint256 public constant ORACLE_DECIMALS = 18;
+    uint256 public constant CALCULATION_DECIMALS = 18;
+    uint256 public constant USDC_TO_CALC_SCALE = 1e12;
+    uint256 public constant KINK_UTILIZATION = 8000; // 80% in basis points
+    uint256 public constant DEFAULT_LTV = 7000; // 70% in basis points
+    uint256 public constant LIQUIDATION_LTV = 7100; // 71% in basis points
+    uint256 public constant DEFAULT_BASE_RATE = 1000;
 
-    uint256 public constant LIQUIDATION_THRESHOLD = 7000; // 70%
-    uint256 private constant USDC_DECIMALS = 6;
-    uint256 private constant ORACLE_DECIMALS = 18; // Oracle returns 18 decimals
-    uint256 private constant CALCULATION_DECIMALS = 18; // Internal calculations in 18 decimals
-    uint256 private constant USDC_TO_CALC_SCALE = 1e12; // 10^(18-6) = 1e12
-    uint256 private constant BASIS_POINTS = 10000;
+    uint256 public constant MIN_DEPOSIT_AMOUNT = 100; // 0.01 USDC
+    uint256 public constant MAX_DEPOSIT_AMOUNT = 1000000000; // 1M USDC
 
     // State variables
-    mapping(address => LenderInfo) public lenders;
-    mapping(address => BorrowerPosition) public borrowers;
+    mapping(address => VaultConfig) public vaultConfigs;
+    mapping(address => mapping(address => LenderInfo)) public vaultLenders;
+    mapping(address => mapping(address => BorrowerPosition)) public borrowers;
+    mapping(address => address[]) public vaultActiveBorrowers;
+    mapping(address => mapping(address => uint256)) public vaultBorrowerIndex;
+    mapping(address => BubbleLPVault) public vaults;
+    mapping(address => uint256) public vaultHardcodedYield; //  hardcoded yield per vault
+    mapping(address => address[]) public vaultActiveLenders;
+    mapping(address => mapping(address => uint256)) public vaultLenderIndex;
+    mapping(address => uint256) public vaultAPY;
 
-    address[] public activeBorrowers;
-    mapping(address => uint256) public borrowerIndex; // borrower => index in activeBorrowers array
+    BubbleLPVault public bubbleVault;
+    IERC20Upgradeable public tokenA;
+    IERC20Upgradeable public tokenB;
+    IERC20Upgradeable public lpToken;
+    IOctoswapRouter02 public octoRouter;
+    IBubbleV1Router public bubbleRouter;
 
-    uint256 public totalLent; // Total USDC lent (6 decimals)
-    uint256 public totalBorrowed; // Total USDC borrowed (6 decimals)
-    uint256 public totalCollateral; // Total vault shares as collateral
-    uint256 public lastAccrualTime; // Last global interest accrual
-    uint256 public accumulatedFees; // Protocol fees (6 decimals)
+    uint256 public lastAccrualTime;
+    uint256 public counter;
 
-    address public gelatoAddress; // Address authorized to perform liquidations
-    bool public liquidationEnabled = true;
-
-    // Emergency controls
+    uint256 public accumulatedFees;
+    bool public liquidationEnabled;
     bool public borrowingPaused;
     bool public liquidationsPaused;
 
-    uint256 public counter = 1;
+    // Fee recipient addresses and borrow caps
+    address public protocolFeeRecipient;
+    mapping(address => address) public vaultFeeRecipient;
+    uint256 public globalMaxBorrow;
+    mapping(address => uint256) public vaultMaxBorrow;
+    // Accrued fees
+    mapping(address => uint256) public accruedVaultFees; // per vault
+    mapping(address => uint256) public accruedProtocolFees; // per vault
+    // Withdrawal control
+    uint256 public maxUtilizationOnWithdraw = 9500; // 95% by default
 
-    //TO ADD AFTER THIS
+    // Add new state variables for interest tracking
+    mapping(address => uint256) public vaultInterestIndex; // Tracks global interest index per vault
+    mapping(address => mapping(address => uint256)) public lenderInterestIndex; // Tracks lender's last interest index
+
+    // Add new state variable to track active vaults
+    address[] public activeVaults;
+    mapping(address => bool) public isActiveVault;
+
+    // Add emergency pause functionality
+    bool public emergencyMode;
 
     // Events
-    event LentUSDC(address indexed lender, uint256 amount, uint256 timestamp);
+    event LentUSDC(
+        address indexed vault,
+        address indexed lender,
+        uint256 amount,
+        uint256 pawUSDCAmount,
+        uint256 timestamp
+    );
     event WithdrewUSDC(
+        address indexed vault,
         address indexed lender,
         uint256 amount,
         uint256 interest,
         uint256 timestamp
     );
     event Borrowed(
+        address indexed vault,
         address indexed borrower,
         uint256 collateral,
         uint256 borrowAmount,
         uint256 timestamp
     );
     event Repaid(
+        address indexed vault,
         address indexed borrower,
         uint256 repayAmount,
         uint256 interest,
         uint256 timestamp
     );
     event Liquidated(
+        address indexed vault,
         address indexed borrower,
         address indexed liquidator,
         uint256 collateralLiquidated,
@@ -128,38 +174,34 @@ contract USDCBorrowingPoolV2 is
         uint256 timestamp
     );
     event CollateralReturned(
+        address indexed vault,
         address indexed borrower,
         uint256 collateralAmount,
         uint256 timestamp
+    );
+    event VaultAdded(
+        address indexed vault,
+        uint256 maxLTV,
+        uint256 liquidationThreshold
+    );
+    event VaultRemoved(address indexed vault);
+    event InterestRateModelUpdated(
+        address indexed vault,
+        uint256 baseRate,
+        uint256 multiplier,
+        uint256 jumpMultiplier,
+        uint256 kink
     );
     event TokensRecovered(
         address indexed token,
         address indexed to,
         uint256 amount
     );
-    event ParametersUpdated(
-        string parameter,
-        uint256 oldValue,
-        uint256 newValue
-    );
-    event EmergencyAction(string action, bool status);
-
-    event GelatoAddressUpdated(
-        address indexed oldAddress,
-        address indexed newAddress
-    );
-
     event CollateralDeposited(
+        address indexed vault,
         address indexed borrower,
-        uint256 collateralAmount,
+        uint256 amount,
         uint256 timestamp
-    );
-
-    event InterestRateModelUpdated(
-        uint256 baseRate,
-        uint256 multiplier,
-        uint256 jumpMultiplier,
-        uint256 kink
     );
 
     constructor() {
@@ -167,52 +209,173 @@ contract USDCBorrowingPoolV2 is
     }
 
     function initialize(
-        address _bubbleVault,
         address _usdc,
+        address _priceFetcher,
+        address _pawUSDC,
+        address _owner,
+        address _bubbleVault,
         address _tokenA,
         address _tokenB,
         address _lpToken,
-        IBubbleV1Router _bubbleRouter,
-        IOctoswapRouter02 _octoRouter,
-        address _priceFetcher,
-        address _owner
+        IOctoswapRouter02 _octoRouter
     ) public initializer {
-        require(_bubbleVault != address(0), "Invalid bubble vault");
         require(_usdc != address(0), "Invalid USDC");
-        require(_tokenA != address(0), "Invalid tokenA");
-        require(_tokenB != address(0), "Invalid tokenB");
-        require(_lpToken != address(0), "Invalid LP token");
-        require(address(_bubbleRouter) != address(0), "Invalid bubble router");
-        require(address(_octoRouter) != address(0), "Invalid octo router");
         require(_priceFetcher != address(0), "Invalid price fetcher");
+        require(_pawUSDC != address(0), "Invalid PawUSDC");
         require(_owner != address(0), "Invalid owner");
+        require(_bubbleVault != address(0), "Invalid bubble vault");
+        require(_tokenA != address(0), "Invalid token A");
+        require(_tokenB != address(0), "Invalid token B");
+        require(_lpToken != address(0), "Invalid LP token");
+        require(address(_octoRouter) != address(0), "Invalid octo router");
 
         __Ownable_init(_owner);
         __ReentrancyGuard_init();
         __Pausable_init();
         __UUPSUpgradeable_init();
 
-        bubbleVault = BubbleLPVault(_bubbleVault);
         usdc = IERC20Upgradeable(_usdc);
+        priceFetcher = IMonadPriceFetcher(_priceFetcher);
+        pawUSDC = PawUSDC(_pawUSDC);
+        bubbleVault = BubbleLPVault(_bubbleVault);
         tokenA = IERC20Upgradeable(_tokenA);
         tokenB = IERC20Upgradeable(_tokenB);
         lpToken = IERC20Upgradeable(_lpToken);
-        bubbleRouter = IBubbleV1Router(_bubbleRouter);
         octoRouter = IOctoswapRouter02(_octoRouter);
-        priceFetcher = IMonadPriceFetcher(_priceFetcher);
-
-        liquidationThreshold = 7000; // 70%
-        maxLTV = 6500; // 65%
-        liquidationPenalty = 500; // 5%
-        lenderShare = 8000; // 80%
-        slippageBPS = 300; // 3%
-        protocolFeeRate = 2000; // 20%
-        baseRate = 200; // 2% base rate (in basis points)
-        multiplier = 1000; // 10% multiplier (in basis points)
-        jumpMultiplier = 10000; // 100% jump multiplier (in basis points)
-        kink = 8000;
-
         lastAccrualTime = block.timestamp;
+        counter = 0;
+    }
+
+    function addVault(
+        address vault,
+        uint256 maxLTV_,
+        uint256 liquidationThreshold_,
+        uint256 liquidationPenalty_,
+        uint256 baseRate_,
+        uint256 multiplier_,
+        uint256 jumpMultiplier_,
+        uint256 kink_,
+        uint256 protocolFeeRate_,
+        uint256 lenderShare_,
+        uint256 slippageBPS_
+    ) external onlyOwner {
+        require(vault != address(0), "Invalid vault address");
+        require(!vaultConfigs[vault].active, "Vault already exists");
+        require(maxLTV_ <= liquidationThreshold_, "Invalid LTV");
+        require(kink_ <= BASIS_POINTS, "Invalid kink");
+        require(protocolFeeRate_ <= BASIS_POINTS, "Invalid protocol fee rate");
+        require(lenderShare_ <= BASIS_POINTS, "Invalid lender share");
+        require(slippageBPS_ <= BASIS_POINTS, "Invalid slippage");
+
+        VaultConfig storage config = vaultConfigs[vault];
+        config.maxLTV = maxLTV_;
+        config.liquidationThreshold = liquidationThreshold_;
+        config.liquidationPenalty = liquidationPenalty_;
+        config.baseRate = baseRate_;
+        config.multiplier = multiplier_;
+        config.jumpMultiplier = jumpMultiplier_;
+        config.kink = kink_;
+        config.protocolFeeRate = protocolFeeRate_;
+        config.lenderShare = lenderShare_;
+        config.slippageBPS = slippageBPS_;
+        config.borrowingEnabled = true;
+        config.active = true;
+
+        vaults[vault] = BubbleLPVault(vault);
+        
+        // Add to active vaults
+        if (!isActiveVault[vault]) {
+            activeVaults.push(vault);
+            isActiveVault[vault] = true;
+        }
+
+        emit VaultAdded(vault, maxLTV_, liquidationThreshold_);
+    }
+
+    function _addActiveBorrower(address vault, address borrower) internal {
+        if (
+            vaultBorrowerIndex[vault][borrower] == 0 &&
+            (vaultActiveBorrowers[vault].length == 0 ||
+                vaultActiveBorrowers[vault][0] != borrower)
+        ) {
+            vaultActiveBorrowers[vault].push(borrower);
+            vaultBorrowerIndex[vault][borrower] = vaultActiveBorrowers[vault]
+                .length;
+        }
+    }
+
+    function _removeActiveBorrower(address vault, address borrower) internal {
+        uint256 index = vaultBorrowerIndex[vault][borrower];
+        if (index == 0) return;
+
+        uint256 arrayIndex = index - 1;
+        uint256 lastIndex = vaultActiveBorrowers[vault].length - 1;
+
+        if (arrayIndex != lastIndex) {
+            address lastBorrower = vaultActiveBorrowers[vault][lastIndex];
+            vaultActiveBorrowers[vault][arrayIndex] = lastBorrower;
+            vaultBorrowerIndex[vault][lastBorrower] = index;
+        }
+
+        vaultActiveBorrowers[vault].pop();
+        delete vaultBorrowerIndex[vault][borrower];
+    }
+
+    function getLiquidatablePositions(address vault, uint256 maxPositions)
+        public
+        view
+        returns (address[] memory liquidatable)
+    {
+        if (!liquidationEnabled || vaultActiveBorrowers[vault].length == 0) {
+            return new address[](0);
+        }
+
+        address[] memory temp = new address[](maxPositions);
+        uint256 count = 0;
+
+        for (
+            uint256 i = 0;
+            i < vaultActiveBorrowers[vault].length && count < maxPositions;
+            i++
+        ) {
+            address borrower = vaultActiveBorrowers[vault][i];
+            BorrowerPosition storage position = borrowers[vault][borrower];
+
+            if (position.isActive && !_isHealthy(vault, borrower, true)) {
+                temp[count] = borrower;
+                count++;
+            }
+        }
+
+        liquidatable = new address[](count);
+        for (uint256 i = 0; i < count; i++) {
+            liquidatable[i] = temp[i];
+        }
+    }
+
+    function getFirstLiquidatablePosition(address vault)
+        public
+        view
+        returns (address borrower)
+    {
+        if (!liquidationEnabled || vaultActiveBorrowers[vault].length == 0) {
+            return address(0);
+        }
+
+        for (uint256 i = 0; i < vaultActiveBorrowers[vault].length; i++) {
+            address currentBorrower = vaultActiveBorrowers[vault][i];
+            BorrowerPosition storage position = borrowers[vault][
+                currentBorrower
+            ];
+
+            if (
+                position.isActive && !_isHealthy(vault, currentBorrower, true)
+            ) {
+                return currentBorrower;
+            }
+        }
+
+        return address(0);
     }
 
     function _authorizeUpgrade(address newImplementation)
@@ -232,8 +395,8 @@ contract USDCBorrowingPoolV2 is
         _;
     }
 
-    modifier onlyActiveBorrower(address borrower) {
-        require(borrowers[borrower].isActive, "No active position");
+    modifier onlyActiveBorrower(address vault, address borrower) {
+        require(borrowers[vault][borrower].isActive, "No active position");
         _;
     }
 
@@ -247,10 +410,9 @@ contract USDCBorrowingPoolV2 is
         _;
     }
 
-    function setGelatoAddress(address _gelatoAddress) external onlyOwner {
-        address oldAddress = gelatoAddress;
-        gelatoAddress = _gelatoAddress;
-        emit GelatoAddressUpdated(oldAddress, _gelatoAddress);
+    modifier notInEmergencyMode() {
+        require(!emergencyMode, "Contract is in emergency mode");
+        _;
     }
 
     function setLiquidationEnabled(bool _enabled) external onlyOwner {
@@ -258,47 +420,66 @@ contract USDCBorrowingPoolV2 is
     }
 
     /// Get current utilization rate
-    function getUtilizationRate() public view returns (uint256) {
-        if (totalLent == 0) return 0;
+    function getUtilizationRate(address vault) public view returns (uint256) {
+        VaultConfig storage config = vaultConfigs[vault];
+        if (config.totalLent == 0) return 0;
         return
-            totalBorrowed.mulDiv(BASIS_POINTS, totalLent, Math.Rounding.Floor);
+            config.totalBorrowed.mulDiv(
+                BASIS_POINTS,
+                config.totalLent,
+                Math.Rounding.Floor
+            );
     }
 
     /// Calculate current borrow rate based on utilization
-    function getBorrowRate() public view returns (uint256) {
-        uint256 utilization = getUtilizationRate();
+    function getBorrowRate(address vault) public view returns (uint256) {
+        require(vaultConfigs[vault].active, "Vault not active");
+        uint256 utilization = getUtilizationRate(vault);
+        uint256 yieldGenerated = vaultHardcodedYield[vault] > 0
+            ? vaultHardcodedYield[vault]
+            : DEFAULT_BASE_RATE;
 
-        if (utilization <= kink) {
-            // Normal rate: baseRate + (utilization * multiplier / 10000)
+        uint256 baseBorrowRate = yieldGenerated / 3;
+
+        if (utilization <= KINK_UTILIZATION) {
+            // Before kink: Use yield method - scale base rate by utilization
             return
-                baseRate +
-                utilization.mulDiv(
-                    multiplier,
+                baseBorrowRate.mulDiv(
+                    utilization,
                     BASIS_POINTS,
                     Math.Rounding.Floor
                 );
         } else {
-            // Jump rate: baseRate + kink * multiplier + (utilization - kink) * jumpMultiplier
-            uint256 normalRate = baseRate +
-                kink.mulDiv(multiplier, BASIS_POINTS, Math.Rounding.Floor);
-            uint256 excessUtil = utilization - kink;
-            uint256 jumpRate = excessUtil.mulDiv(
-                jumpMultiplier,
+            // After kink (>80%): Use kink method - base rate + jump rate
+            VaultConfig storage config = vaultConfigs[vault];
+
+            // Calculate base rate at kink point
+            uint256 baseRateAtKink = baseBorrowRate.mulDiv(
+                KINK_UTILIZATION,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
-            return normalRate + jumpRate;
+
+            // Calculate jump rate for utilization above kink
+            uint256 excessUtilization = utilization - KINK_UTILIZATION;
+            uint256 jumpRate = excessUtilization.mulDiv(
+                config.jumpMultiplier,
+                BASIS_POINTS,
+                Math.Rounding.Floor
+            );
+
+            return baseRateAtKink + jumpRate;
         }
     }
 
     /// Calculate supply rate (what lenders earn)
-    function getSupplyRate() public view returns (uint256) {
-        uint256 utilization = getUtilizationRate();
-        uint256 borrowRate = getBorrowRate();
+    function getSupplyRate(address vault) public view returns (uint256) {
+        uint256 utilization = getUtilizationRate(vault);
+        uint256 borrowRate = getBorrowRate(vault);
 
         // Supply Rate = Borrow Rate * Utilization * (1 - Reserve Factor)
         uint256 rateToPool = borrowRate.mulDiv(
-            lenderShare,
+            vaultConfigs[vault].lenderShare,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
@@ -325,7 +506,6 @@ contract USDCBorrowingPoolV2 is
     }
 
     /// Get token price in USDC using oracle
-    /// @param token Token address
     /// @return price Price in calculation decimals (18 decimals) representing USDC value per token
     function _getTokenPriceInUSDC(address token)
         internal
@@ -460,70 +640,57 @@ contract USDCBorrowingPoolV2 is
         );
     }
 
-    function _addActiveBorrower(address borrower) internal {
-        if (
-            borrowerIndex[borrower] == 0 &&
-            (activeBorrowers.length == 0 || activeBorrowers[0] != borrower)
-        ) {
-            activeBorrowers.push(borrower);
-            borrowerIndex[borrower] = activeBorrowers.length;
-        }
-    }
-
-    function _removeActiveBorrower(address borrower) internal {
-        uint256 index = borrowerIndex[borrower];
-        if (index == 0) return; // Not in array or first element already handled
-
-        uint256 arrayIndex = index - 1; // Convert to 0-based indexing
-        uint256 lastIndex = activeBorrowers.length - 1;
-
-        if (arrayIndex != lastIndex) {
-            address lastBorrower = activeBorrowers[lastIndex];
-            activeBorrowers[arrayIndex] = lastBorrower;
-            borrowerIndex[lastBorrower] = index;
-        }
-
-        activeBorrowers.pop();
-        delete borrowerIndex[borrower];
-    }
-
     ///  Lend USDC to the pool
     /// @param amount Amount (6 decimals) of USDC to lend
-    function lendUSDC(uint256 amount)
+    function lendUSDC(address vault, uint256 amount)
         external
         nonReentrant
-        whenNotPaused
         validAmount(amount)
+        notInEmergencyMode
     {
-        _accrueInterest();
+        require(amount >= MIN_DEPOSIT_AMOUNT, "Amount too small");
+        require(amount <= MAX_DEPOSIT_AMOUNT, "Amount too large");
+        require(vaultConfigs[vault].active, "Vault not active");
 
-        LenderInfo storage lender = lenders[msg.sender];
+        _accrueInterest(vault);
+
+        LenderInfo storage lender = vaultLenders[vault][msg.sender];
         if (lender.depositAmount > 0) {
-            _updateLenderInterest(msg.sender);
+            _updateLenderInterest(vault, msg.sender);
         }
 
         lender.depositAmount += amount;
         lender.lastUpdateTime = block.timestamp;
-        totalLent += amount;
+        lenderInterestIndex[vault][msg.sender] = vaultInterestIndex[vault];
+        vaultConfigs[vault].totalLent += amount;
+
+        _addActiveLender(vault, msg.sender);
 
         usdc.safeTransferFrom(msg.sender, address(this), amount);
-        emit LentUSDC(msg.sender, amount, block.timestamp);
+
+        // Mint PawUSDC to lender
+        pawUSDC.mint(msg.sender, amount);
+        lender.pawUSDCAmount += amount;
+
+        emit LentUSDC(vault, msg.sender, amount, amount, block.timestamp);
     }
 
     ///  Withdraw lent USDC plus earned interest
     /// @param amount Amount to withdraw (0 = withdraw all)
-    function withdrawUSDC(uint256 amount) external nonReentrant whenNotPaused {
-        LenderInfo storage lender = lenders[msg.sender];
+    function withdrawUSDC(address vault, uint256 amount) external nonReentrant notInEmergencyMode {
+        LenderInfo storage lender = vaultLenders[vault][msg.sender];
         require(lender.depositAmount > 0, "No deposit found");
+        require(amount > 0, "Amount must be greater than 0");
 
-        _accrueInterest();
-        _updateLenderInterest(msg.sender);
+        _accrueInterest(vault);
+        _updateLenderInterest(vault, msg.sender);
 
         if (amount == 0) {
             amount = lender.depositAmount;
         }
         require(amount <= lender.depositAmount, "Insufficient deposit");
 
+        // Calculate interest to withdraw proportionally
         uint256 interestToWithdraw = lender.accruedInterest.mulDiv(
             amount,
             lender.depositAmount,
@@ -536,12 +703,41 @@ contract USDCBorrowingPoolV2 is
             "Insufficient liquidity"
         );
 
+        // Withdrawal control: check utilization after withdrawal
+        uint256 newTotalLent = vaultConfigs[vault].totalLent - amount;
+        uint256 utilizationAfter = newTotalLent == 0
+            ? 0
+            : vaultConfigs[vault].totalBorrowed.mulDiv(
+                BASIS_POINTS,
+                newTotalLent,
+                Math.Rounding.Floor
+            );
+        require(
+            utilizationAfter <= maxUtilizationOnWithdraw,
+            "Utilization too high after withdrawal"
+        );
+
+        // Update lender state
         lender.depositAmount -= amount;
         lender.accruedInterest -= interestToWithdraw;
-        totalLent -= amount;
+        lender.lastUpdateTime = block.timestamp;
+        lenderInterestIndex[vault][msg.sender] = vaultInterestIndex[vault];
+
+        // Update vault state
+        vaultConfigs[vault].totalLent -= amount;
+
+        // Remove from active lenders if fully withdrawn
+        if (lender.depositAmount == 0) {
+            _removeActiveLender(vault, msg.sender);
+        }
+
+        // Burn PawUSDC tokens
+        pawUSDC.burn(msg.sender, amount);
+        lender.pawUSDCAmount -= amount;
 
         usdc.safeTransfer(msg.sender, totalWithdraw);
         emit WithdrewUSDC(
+            vault,
             msg.sender,
             amount,
             interestToWithdraw,
@@ -550,11 +746,10 @@ contract USDCBorrowingPoolV2 is
     }
 
     // Add this new function for depositing additional collateral
-    function depositCollateral(uint256 collateralAmount)
+    function depositCollateral(address vault, uint256 collateralAmount)
         external
         nonReentrant
-        whenNotPaused
-        onlyActiveBorrower(msg.sender)
+        onlyActiveBorrower(vault, msg.sender)
         validAmount(collateralAmount)
     {
         require(
@@ -563,10 +758,10 @@ contract USDCBorrowingPoolV2 is
             "Insufficient vault shares balance"
         );
 
-        _accrueInterest();
-        _updateBorrowerInterest(msg.sender);
+        _accrueInterest(vault);
+        _updateBorrowerInterest(vault, msg.sender);
 
-        BorrowerPosition storage position = borrowers[msg.sender];
+        BorrowerPosition storage position = borrowers[vault][msg.sender];
 
         IERC20Upgradeable(address(bubbleVault)).safeTransferFrom(
             msg.sender,
@@ -577,26 +772,45 @@ contract USDCBorrowingPoolV2 is
         position.collateralAmount += collateralAmount;
         position.lastUpdateTime = block.timestamp;
 
-        totalCollateral += collateralAmount;
+        vaultConfigs[vault].totalCollateral += collateralAmount;
 
-        emit CollateralDeposited(msg.sender, collateralAmount, block.timestamp);
+        emit CollateralDeposited(
+            vault,
+            msg.sender,
+            collateralAmount,
+            block.timestamp
+        );
     }
 
-    function borrow(uint256 collateralAmount, uint256 borrowAmount)
-        external
-        nonReentrant
-        whenNotPaused
-        notBorrowingPaused
-        validAmount(borrowAmount) // Remove validAmount check for collateralAmount to allow 0
-    {
+    function borrow(
+        address vault,
+        uint256 collateralAmount,
+        uint256 borrowAmount
+    ) external nonReentrant notBorrowingPaused validAmount(borrowAmount) notInEmergencyMode {
+        require(vaultConfigs[vault].active, "Vault not active");
+        require(vaultConfigs[vault].borrowingEnabled, "Borrowing disabled");
         require(
             usdc.balanceOf(address(this)) >= borrowAmount,
             "Insufficient liquidity"
         );
 
-        _accrueInterest();
+        _accrueInterest(vault);
 
-        BorrowerPosition storage position = borrowers[msg.sender];
+        // Enforce max borrow caps
+        uint256 newVaultTotalBorrowed = vaultConfigs[vault].totalBorrowed +
+            borrowAmount;
+        require(
+            vaultMaxBorrow[vault] == 0 ||
+                newVaultTotalBorrowed <= vaultMaxBorrow[vault],
+            "Exceeds vault max borrow cap"
+        );
+        require(
+            globalMaxBorrow == 0 ||
+                (getTotalBorrowedAllVaults() + borrowAmount) <= globalMaxBorrow,
+            "Exceeds global max borrow cap"
+        );
+
+        BorrowerPosition storage position = borrowers[vault][msg.sender];
 
         if (collateralAmount > 0) {
             require(
@@ -616,7 +830,7 @@ contract USDCBorrowingPoolV2 is
         uint256 totalCollateralAmount = collateralAmount;
 
         if (position.isActive) {
-            _updateBorrowerInterest(msg.sender);
+            _updateBorrowerInterest(vault, msg.sender);
 
             // Add existing debt and collateral
             uint256 existingDebt = position.borrowedAmount +
@@ -634,7 +848,7 @@ contract USDCBorrowingPoolV2 is
         require(totalCollateralValueUSDC > 0, "Invalid collateral value");
 
         uint256 maxBorrowAmount = totalCollateralValueUSDC.mulDiv(
-            maxLTV,
+            vaultConfigs[vault].maxLTV,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
@@ -648,21 +862,22 @@ contract USDCBorrowingPoolV2 is
             position.collateralAmount = collateralAmount;
             position.borrowedAmount = borrowAmount;
             position.isActive = true;
-            _addActiveBorrower(msg.sender);
+            _addActiveBorrower(vault, msg.sender);
         }
         position.lastUpdateTime = block.timestamp;
 
         require(
-            _isHealthy(msg.sender, false),
+            _isHealthy(vault, msg.sender, false),
             "Position unhealthy after borrow"
         );
 
         // Update pool state
-        totalCollateral += collateralAmount;
-        totalBorrowed += borrowAmount;
+        vaultConfigs[vault].totalCollateral += collateralAmount;
+        vaultConfigs[vault].totalBorrowed += borrowAmount;
 
         usdc.safeTransfer(msg.sender, borrowAmount);
         emit Borrowed(
+            vault,
             msg.sender,
             collateralAmount,
             borrowAmount,
@@ -671,7 +886,7 @@ contract USDCBorrowingPoolV2 is
     }
 
     // Add this view function to check borrowing capacity
-    function getBorrowingCapacity(address borrower)
+    function getBorrowingCapacity(address vault, address borrower)
         external
         view
         returns (
@@ -680,7 +895,7 @@ contract USDCBorrowingPoolV2 is
             uint256 availableToBorrow
         )
     {
-        BorrowerPosition storage position = borrowers[borrower];
+        BorrowerPosition storage position = borrowers[vault][borrower];
 
         if (!position.isActive) {
             return (0, 0, 0);
@@ -690,13 +905,13 @@ contract USDCBorrowingPoolV2 is
             position.collateralAmount
         );
         maxBorrow = collateralValueUSDC.mulDiv(
-            maxLTV,
+            vaultConfigs[vault].maxLTV,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
         currentDebt =
             position.borrowedAmount +
-            _calculateBorrowerInterest(borrower);
+            _calculateBorrowerInterest(vault, borrower);
         availableToBorrow = maxBorrow > currentDebt
             ? maxBorrow - currentDebt
             : 0;
@@ -704,17 +919,18 @@ contract USDCBorrowingPoolV2 is
 
     ///  Repay borrowed USDC
     /// @param repayAmount Amount to repay
-    function repay(uint256 repayAmount)
+    function repay(address vault, uint256 repayAmount)
         external
         nonReentrant
-        whenNotPaused
-        onlyActiveBorrower(msg.sender)
+        onlyActiveBorrower(vault, msg.sender)
         validAmount(repayAmount)
+        notInEmergencyMode
     {
-        BorrowerPosition storage position = borrowers[msg.sender];
+        BorrowerPosition storage position = borrowers[vault][msg.sender];
+        VaultConfig storage config = vaultConfigs[vault];
 
-        _accrueInterest();
-        _updateBorrowerInterest(msg.sender);
+        _accrueInterest(vault);
+        _updateBorrowerInterest(vault, msg.sender);
 
         uint256 totalDebt = position.borrowedAmount + position.accruedInterest;
         require(
@@ -728,7 +944,21 @@ contract USDCBorrowingPoolV2 is
         uint256 interestPaid = Math.min(repayAmount, position.accruedInterest);
         uint256 principalPaid = repayAmount - interestPaid;
 
-        // Update position
+        // Split interest according to vault config
+        uint256 vaultFee = interestPaid.mulDiv(
+            config.vaultFeeRate,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        uint256 protocolFee = interestPaid.mulDiv(
+            config.protocolFeeRate,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        uint256 lenderInterest = interestPaid - vaultFee - protocolFee;
+
+        accruedVaultFees[vault] += vaultFee;
+        accruedProtocolFees[vault] += protocolFee;
         position.accruedInterest -= interestPaid;
         position.borrowedAmount -= principalPaid;
         position.lastUpdateTime = block.timestamp;
@@ -743,20 +973,12 @@ contract USDCBorrowingPoolV2 is
             collateralToReturn = position.collateralAmount;
             position.collateralAmount = 0;
             position.isActive = false;
-            totalCollateral -= collateralToReturn;
-            _removeActiveBorrower(msg.sender);
+            vaultConfigs[vault].totalCollateral -= collateralToReturn;
+            _removeActiveBorrower(vault, msg.sender);
         }
 
         // Update pool state
-        totalBorrowed -= principalPaid;
-
-        // Protocol fee
-        uint256 protocolFee = interestPaid.mulDiv(
-            protocolFeeRate,
-            BASIS_POINTS,
-            Math.Rounding.Floor
-        );
-        accumulatedFees += protocolFee;
+        vaultConfigs[vault].totalBorrowed -= principalPaid;
 
         // Return collateral if fully repaid
         if (collateralToReturn > 0) {
@@ -765,22 +987,29 @@ contract USDCBorrowingPoolV2 is
                 collateralToReturn
             );
             emit CollateralReturned(
+                vault,
                 msg.sender,
                 collateralToReturn,
                 block.timestamp
             );
         }
 
-        emit Repaid(msg.sender, repayAmount, interestPaid, block.timestamp);
+        emit Repaid(
+            vault,
+            msg.sender,
+            repayAmount,
+            interestPaid,
+            block.timestamp
+        );
     }
 
     ///  Check if position is healthy
-    function _isHealthy(address borrower, bool forLiquidation)
-        internal
-        view
-        returns (bool)
-    {
-        BorrowerPosition storage position = borrowers[borrower];
+    function _isHealthy(
+        address vault,
+        address borrower,
+        bool forLiquidation
+    ) internal view returns (bool) {
+        BorrowerPosition storage position = borrowers[vault][borrower];
         if (!position.isActive || position.collateralAmount == 0) return true;
 
         // (6 decimals)
@@ -790,11 +1019,13 @@ contract USDCBorrowingPoolV2 is
 
         //  (6 decimals)
         uint256 totalDebtUSDC = position.borrowedAmount +
-            _calculateBorrowerInterest(borrower);
+            _calculateBorrowerInterest(vault, borrower);
 
         if (totalDebtUSDC == 0) return true;
 
-        uint256 threshold = forLiquidation ? liquidationThreshold : maxLTV;
+        uint256 threshold = forLiquidation
+            ? vaultConfigs[vault].liquidationThreshold
+            : vaultConfigs[vault].maxLTV;
 
         // LTV: debt/collateral * 10000
         uint256 currentLTV = totalDebtUSDC.mulDiv(
@@ -808,41 +1039,78 @@ contract USDCBorrowingPoolV2 is
 
     ///  Liquidate unhealthy position
     /// @param borrower Address of borrower to liquidate
-    function liquidate(address borrower)
+    function liquidate(address vault, address borrower)
         external
         nonReentrant
-        whenNotPaused
         notLiquidationsPaused
-        onlyActiveBorrower(borrower)
+        onlyActiveBorrower(vault, borrower)
+        notInEmergencyMode
     {
         require(liquidationEnabled, "Liquidation is disabled");
-        _accrueInterest();
-        _updateBorrowerInterest(borrower);
+        require(vaultConfigs[vault].active, "Vault not active");
 
-        require(!_isHealthy(borrower, true), "Position is healthy");
+        _accrueInterest(vault);
+        _updateBorrowerInterest(vault, borrower);
 
-        BorrowerPosition storage position = borrowers[borrower];
+        require(!_isHealthy(vault, borrower, true), "Position is healthy");
+
+        BorrowerPosition storage position = borrowers[vault][borrower];
         uint256 totalDebt = position.borrowedAmount + position.accruedInterest;
         uint256 collateralToLiquidate = position.collateralAmount;
 
         // Convert collateral to USDC
-        uint256 usdcRecovered = _liquidateCollateral(collateralToLiquidate);
+        uint256 usdcRecovered = _liquidateCollateral(vault, collateralToLiquidate);
         require(usdcRecovered > 0, "Liquidation failed");
+
+        VaultConfig storage config = vaultConfigs[vault];
 
         // Calculate liquidation penalty
         uint256 penalty = usdcRecovered.mulDiv(
-            liquidationPenalty,
+            config.liquidationPenalty,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
+
+        // Split penalty according to vault config
+        uint256 vaultPenalty = penalty.mulDiv(
+            config.vaultFeeRate,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        uint256 protocolPenalty = penalty.mulDiv(
+            config.protocolFeeRate,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        uint256 lenderPenalty = penalty - vaultPenalty - protocolPenalty;
+
+        // Update fees
+        accruedVaultFees[vault] += vaultPenalty;
+        accruedProtocolFees[vault] += protocolPenalty;
+
+        // Distribute lender penalty to all active lenders
+        if (lenderPenalty > 0 && vaultConfigs[vault].totalLent > 0) {
+            address[] storage activeLenders = vaultActiveLenders[vault];
+            for (uint256 i = 0; i < activeLenders.length; i++) {
+                address lender = activeLenders[i];
+                LenderInfo storage lenderInfo = vaultLenders[vault][lender];
+                
+                uint256 lenderShare = lenderPenalty.mulDiv(
+                    lenderInfo.depositAmount,
+                    vaultConfigs[vault].totalLent,
+                    Math.Rounding.Floor
+                );
+                
+                lenderInfo.accruedInterest += lenderShare;
+            }
+        }
+
+        // Calculate debt repayment
         uint256 availableForDebt = usdcRecovered - penalty;
         uint256 debtRepayment = Math.min(totalDebt, availableForDebt);
 
         // Update position
-        uint256 principalRepaid = Math.min(
-            debtRepayment,
-            position.borrowedAmount
-        );
+        uint256 principalRepaid = Math.min(debtRepayment, position.borrowedAmount);
         uint256 interestRepaid = debtRepayment - principalRepaid;
 
         position.borrowedAmount -= principalRepaid;
@@ -851,24 +1119,14 @@ contract USDCBorrowingPoolV2 is
         position.isActive = false;
 
         // Update pool state
-        totalBorrowed -= principalRepaid;
-        totalCollateral -= collateralToLiquidate;
+        vaultConfigs[vault].totalBorrowed -= principalRepaid;
+        vaultConfigs[vault].totalCollateral -= collateralToLiquidate;
 
-        // Protocol fee from interest
-        uint256 protocolFee = interestRepaid.mulDiv(
-            protocolFeeRate,
-            BASIS_POINTS,
-            Math.Rounding.Floor
-        );
-        accumulatedFees += protocolFee;
-
-        // Transfer penalty to site
-        if (penalty > 0) {
-            usdc.safeTransfer(msg.sender, penalty);
-        }
+        _removeActiveBorrower(vault, borrower);
 
         counter = counter + 1;
         emit Liquidated(
+            vault,
             borrower,
             msg.sender,
             collateralToLiquidate,
@@ -878,46 +1136,54 @@ contract USDCBorrowingPoolV2 is
         );
     }
 
-    function liquidateMultiple(address[] calldata borrowersToLiquidate)
-        external
-        nonReentrant
-        whenNotPaused
-        notLiquidationsPaused
-    {
+    function liquidateMultiple(address vault, address[] calldata borrowersToLiquidate) external nonReentrant notLiquidationsPaused notInEmergencyMode {
         require(liquidationEnabled, "Liquidation is disabled");
         require(borrowersToLiquidate.length > 0, "No borrowers provided");
-        require(
-            borrowersToLiquidate.length <= 10,
-            "Too many borrowers at once"
-        );
+        require(borrowersToLiquidate.length <= 10, "Too many borrowers at once");
+
+        uint256 totalLenderPenalty = 0;
 
         for (uint256 i = 0; i < borrowersToLiquidate.length; i++) {
             address borrower = borrowersToLiquidate[i];
-            BorrowerPosition storage position = borrowers[borrower];
+            BorrowerPosition storage position = borrowers[vault][borrower];
 
             if (!position.isActive) continue;
-            _updateBorrowerInterest(borrower);
-            if (_isHealthy(borrower, true)) continue;
+            _updateBorrowerInterest(vault, borrower);
+            if (_isHealthy(vault, borrower, true)) continue;
 
-            uint256 totalDebt = position.borrowedAmount +
-                position.accruedInterest;
+            uint256 totalDebt = position.borrowedAmount + position.accruedInterest;
             uint256 collateralToLiquidate = position.collateralAmount;
 
-            uint256 usdcRecovered = _liquidateCollateral(collateralToLiquidate);
+            uint256 usdcRecovered = _liquidateCollateral(vault, collateralToLiquidate);
             if (usdcRecovered == 0) continue;
 
             uint256 penalty = usdcRecovered.mulDiv(
-                liquidationPenalty,
+                vaultConfigs[vault].liquidationPenalty,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
+
+            // Split penalty according to vault config
+            uint256 vaultPenalty = penalty.mulDiv(
+                vaultConfigs[vault].vaultFeeRate,
+                BASIS_POINTS,
+                Math.Rounding.Floor
+            );
+            uint256 protocolPenalty = penalty.mulDiv(
+                vaultConfigs[vault].protocolFeeRate,
+                BASIS_POINTS,
+                Math.Rounding.Floor
+            );
+            uint256 lenderPenalty = penalty - vaultPenalty - protocolPenalty;
+
+            accruedVaultFees[vault] += vaultPenalty;
+            accruedProtocolFees[vault] += protocolPenalty;
+            totalLenderPenalty += lenderPenalty;
+
             uint256 availableForDebt = usdcRecovered - penalty;
             uint256 debtRepayment = Math.min(totalDebt, availableForDebt);
 
-            uint256 principalRepaid = Math.min(
-                debtRepayment,
-                position.borrowedAmount
-            );
+            uint256 principalRepaid = Math.min(debtRepayment, position.borrowedAmount);
             uint256 interestRepaid = debtRepayment - principalRepaid;
 
             position.borrowedAmount -= principalRepaid;
@@ -925,22 +1191,14 @@ contract USDCBorrowingPoolV2 is
             position.collateralAmount = 0;
             position.isActive = false;
 
-            _removeActiveBorrower(borrower);
+            _removeActiveBorrower(vault, borrower);
 
-            totalBorrowed -= principalRepaid;
-            totalCollateral -= collateralToLiquidate;
-
-            uint256 protocolFee = interestRepaid.mulDiv(
-                2000,
-                BASIS_POINTS,
-                Math.Rounding.Floor
-            );
-            accumulatedFees += protocolFee;
-
-            // Keep any excess as protocol revenue
+            vaultConfigs[vault].totalBorrowed -= principalRepaid;
+            vaultConfigs[vault].totalCollateral -= collateralToLiquidate;
 
             counter = counter + 1;
             emit Liquidated(
+                vault,
                 borrower,
                 msg.sender,
                 collateralToLiquidate,
@@ -949,10 +1207,27 @@ contract USDCBorrowingPoolV2 is
                 block.timestamp
             );
         }
+
+        // Distribute total lender penalty to all active lenders
+        if (totalLenderPenalty > 0 && vaultConfigs[vault].totalLent > 0) {
+            address[] storage activeLenders = vaultActiveLenders[vault];
+            for (uint256 i = 0; i < activeLenders.length; i++) {
+                address lender = activeLenders[i];
+                LenderInfo storage lenderInfo = vaultLenders[vault][lender];
+                
+                uint256 lenderShare = totalLenderPenalty.mulDiv(
+                    lenderInfo.depositAmount,
+                    vaultConfigs[vault].totalLent,
+                    Math.Rounding.Floor
+                );
+                
+                lenderInfo.accruedInterest += lenderShare;
+            }
+        }
     }
 
     /// Convert vault shares to USDC through liquidation
-    function _liquidateCollateral(uint256 vaultShares)
+    function _liquidateCollateral(address vault, uint256 vaultShares)
         internal
         returns (uint256 usdcAmount)
     {
@@ -990,7 +1265,7 @@ contract USDCBorrowingPoolV2 is
 
         uint256[] memory amountsOut = octoRouter.getAmountsOut(amount, path);
         uint256 minOut = amountsOut[1].mulDiv(
-            BASIS_POINTS - slippageBPS,
+            BASIS_POINTS - vaultConfigs[address(this)].slippageBPS,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
@@ -1009,38 +1284,39 @@ contract USDCBorrowingPoolV2 is
     // INTEREST CALCULATION FUNCTIONS
 
     /// Calculate borrower interest
-    function _calculateBorrowerInterest(address borrower)
+    function _calculateBorrowerInterest(address vault, address borrower)
         internal
         view
         returns (uint256)
     {
-        BorrowerPosition storage position = borrowers[borrower];
+        BorrowerPosition storage position = borrowers[vault][borrower];
         if (!position.isActive || position.borrowedAmount == 0)
             return position.accruedInterest;
 
         uint256 timeElapsed = block.timestamp - position.lastUpdateTime;
-        uint256 currentBorrowRate = getBorrowRate();
+         if (timeElapsed == 0) return position.accruedInterest;
+        uint256 currentBorrowRate = getBorrowRate(vault);
 
         uint256 newInterest = position.borrowedAmount.mulDiv(
-            currentBorrowRate * timeElapsed,
-            BASIS_POINTS * 365 days,
-            Math.Rounding.Ceil
-        );
+        currentBorrowRate.mulDiv(timeElapsed, 365 days, Math.Rounding.Ceil),
+        BASIS_POINTS,
+        Math.Rounding.Ceil
+    );
 
         return position.accruedInterest + newInterest;
     }
 
     /// Calculate lender interest
-    function _calculateLenderInterest(address lender)
+    function _calculateLenderInterest(address vault, address lender)
         internal
         view
         returns (uint256)
     {
-        LenderInfo storage info = lenders[lender];
+        LenderInfo storage info = vaultLenders[vault][lender];
         if (info.depositAmount == 0) return info.accruedInterest;
 
         uint256 timeElapsed = block.timestamp - info.lastUpdateTime;
-        uint256 currentSupplyRate = getSupplyRate();
+        uint256 currentSupplyRate = getSupplyRate(vault);
 
         uint256 newInterest = info.depositAmount.mulDiv(
             currentSupplyRate * timeElapsed,
@@ -1052,27 +1328,128 @@ contract USDCBorrowingPoolV2 is
     }
 
     /// Update borrower interest
-    function _updateBorrowerInterest(address borrower) internal {
-        BorrowerPosition storage position = borrowers[borrower];
-        position.accruedInterest = _calculateBorrowerInterest(borrower);
+    function _updateBorrowerInterest(address vault, address borrower) internal {
+        BorrowerPosition storage position = borrowers[vault][borrower];
+        position.accruedInterest = _calculateBorrowerInterest(vault, borrower);
         position.lastUpdateTime = block.timestamp;
     }
 
     /// Update lender interest
-    function _updateLenderInterest(address lender) internal {
-        LenderInfo storage info = lenders[lender];
-        info.accruedInterest = _calculateLenderInterest(lender);
+    function _updateLenderInterest(address vault, address lender) internal {
+        LenderInfo storage info = vaultLenders[vault][lender];
+        if (info.depositAmount == 0) return;
+
+        uint256 currentIndex = vaultInterestIndex[vault];
+        uint256 lastIndex = lenderInterestIndex[vault][lender];
+        
+        if (currentIndex > lastIndex) {
+            uint256 indexDelta = currentIndex - lastIndex;
+            uint256 interestAccrued = info.depositAmount.mulDiv(
+                indexDelta,
+                1e18,
+                Math.Rounding.Floor
+            );
+            info.accruedInterest += interestAccrued;
+        }
+        
+        lenderInterestIndex[vault][lender] = currentIndex;
         info.lastUpdateTime = block.timestamp;
     }
 
     /// Accrue global interest
-    function _accrueInterest() internal {
+    function _accrueInterest(address vault) internal {
+        uint256 timeElapsed = block.timestamp - lastAccrualTime;
+        if (timeElapsed == 0) return;
+
+        VaultConfig storage config = vaultConfigs[vault];
+
+        // Calculate global interest rates
+        uint256 borrowRate = getBorrowRate(vault);
+        uint256 supplyRate = getSupplyRate(vault);
+
+        // Update global interest index
+        if (config.totalLent > 0) {
+            uint256 interestAccrued = _calculateInterest(
+                config.totalLent,
+                supplyRate,
+                timeElapsed
+            );
+            // Update interest index instead of adding to totalLent
+            vaultInterestIndex[vault] += interestAccrued.mulDiv(
+                1e18,
+                config.totalLent,
+                Math.Rounding.Floor
+            );
+        }
+
+        // Accrue interest for all active borrowers
+        address[] storage activeBorrowers = vaultActiveBorrowers[vault];
+        for (uint256 i = 0; i < activeBorrowers.length; i++) {
+            address borrower = activeBorrowers[i];
+            BorrowerPosition storage position = borrowers[vault][borrower];
+
+            if (position.isActive && position.borrowedAmount > 0) {
+                uint256 interest = _calculateInterest(
+                    position.borrowedAmount,
+                    borrowRate,
+                    timeElapsed
+                );
+
+                // Split interest according to vault config
+                uint256 vaultFee = interest.mulDiv(
+                    config.vaultFeeRate,
+                    BASIS_POINTS,
+                    Math.Rounding.Floor
+                );
+                uint256 protocolFee = interest.mulDiv(
+                    config.protocolFeeRate,
+                    BASIS_POINTS,
+                    Math.Rounding.Floor
+                );
+                uint256 lenderInterest = interest - vaultFee - protocolFee;
+
+                // Update fees
+                accruedVaultFees[vault] += vaultFee;
+                accruedProtocolFees[vault] += protocolFee;
+
+                // Update position
+                position.accruedInterest += interest;
+                position.lastUpdateTime = block.timestamp;
+            }
+        }
+
         lastAccrualTime = block.timestamp;
     }
 
-    // VIEW FUNCTIONS
+    function _calculateInterest(
+        uint256 principal,
+        uint256 rate,
+        uint256 timeElapsed
+    ) internal pure returns (uint256) {
+        if (principal == 0 || rate == 0 || timeElapsed == 0) return 0;
+        
+        // Prevent overflow in multiplication
+        if (rate > type(uint256).max / timeElapsed) {
+            return principal.mulDiv(
+                rate,
+                365 days,
+                Math.Rounding.Ceil
+            ).mulDiv(
+                timeElapsed,
+                1,
+                Math.Rounding.Ceil
+            );
+        }
+        
+        return principal.mulDiv(
+            rate * timeElapsed,
+            BASIS_POINTS * 365 days,
+            Math.Rounding.Ceil
+        );
+    }
 
     function updateInterestRateModel(
+        address vault,
         uint256 _baseRate,
         uint256 _multiplier,
         uint256 _jumpMultiplier,
@@ -1081,12 +1458,14 @@ contract USDCBorrowingPoolV2 is
         require(_kink <= BASIS_POINTS, "Invalid kink");
         require(_baseRate <= 2000, "Base rate too high"); // Max 20%
 
-        baseRate = _baseRate;
-        multiplier = _multiplier;
-        jumpMultiplier = _jumpMultiplier;
-        kink = _kink;
+        VaultConfig storage config = vaultConfigs[vault];
+        config.baseRate = _baseRate;
+        config.multiplier = _multiplier;
+        config.jumpMultiplier = _jumpMultiplier;
+        config.kink = _kink;
 
         emit InterestRateModelUpdated(
+            vault,
             _baseRate,
             _multiplier,
             _jumpMultiplier,
@@ -1095,7 +1474,7 @@ contract USDCBorrowingPoolV2 is
     }
 
     /// Get current rates for display
-    function getCurrentRates()
+    function getCurrentRates(address vault)
         external
         view
         returns (
@@ -1104,32 +1483,36 @@ contract USDCBorrowingPoolV2 is
             uint256 supplyRate
         )
     {
-        utilization = getUtilizationRate();
-        borrowRate = getBorrowRate();
-        supplyRate = getSupplyRate();
+        utilization = getUtilizationRate(vault);
+        borrowRate = getBorrowRate(vault);
+        supplyRate = getSupplyRate(vault);
     }
 
     /// Get rate at specific utilization (for frontend curves)
-    function getRateAtUtilization(uint256 utilizationRate)
+    function getRateAtUtilization(address vault, uint256 utilizationRate)
         external
         view
         returns (uint256 borrowRate, uint256 supplyRate)
     {
         // Temporarily calculate rates at given utilization
-        if (utilizationRate <= kink) {
+        if (utilizationRate <= vaultConfigs[vault].kink) {
             borrowRate =
-                baseRate +
+                vaultConfigs[vault].baseRate +
                 utilizationRate.mulDiv(
-                    multiplier,
+                    vaultConfigs[vault].multiplier,
                     BASIS_POINTS,
                     Math.Rounding.Floor
                 );
         } else {
-            uint256 normalRate = baseRate +
-                kink.mulDiv(multiplier, BASIS_POINTS, Math.Rounding.Floor);
-            uint256 excessUtil = utilizationRate - kink;
+            uint256 normalRate = vaultConfigs[vault].baseRate +
+                vaultConfigs[vault].kink.mulDiv(
+                    vaultConfigs[vault].multiplier,
+                    BASIS_POINTS,
+                    Math.Rounding.Floor
+                );
+            uint256 excessUtil = utilizationRate - vaultConfigs[vault].kink;
             uint256 jumpRate = excessUtil.mulDiv(
-                jumpMultiplier,
+                vaultConfigs[vault].jumpMultiplier,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
@@ -1137,7 +1520,7 @@ contract USDCBorrowingPoolV2 is
         }
 
         uint256 rateToPool = borrowRate.mulDiv(
-            lenderShare,
+            vaultConfigs[vault].lenderShare,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
@@ -1149,55 +1532,63 @@ contract USDCBorrowingPoolV2 is
     }
 
     ///  Get borrower position with current interest
-    function getBorrowerPosition(address borrower)
+    function getBorrowerPosition(address vault, address borrower)
         external
         view
         returns (BorrowerPosition memory position)
     {
-        position = borrowers[borrower];
-        position.accruedInterest = _calculateBorrowerInterest(borrower);
+        position = borrowers[vault][borrower];
+        position.accruedInterest = _calculateBorrowerInterest(vault, borrower);
     }
 
     ///  Get lender info with current interest
-    function getLenderInfo(address lender)
+    function getLenderInfo(address vault, address lender)
         external
         view
         returns (LenderInfo memory info)
     {
-        info = lenders[lender];
-        info.accruedInterest = _calculateLenderInterest(lender);
+        info = vaultLenders[vault][lender];
+        info.accruedInterest = _calculateLenderInterest(vault, lender);
     }
 
     ///  Check if position can be liquidated
-    function canLiquidate(address borrower) external view returns (bool) {
-        BorrowerPosition storage position = borrowers[borrower];
+    function canLiquidate(address vault, address borrower)
+        external
+        view
+        returns (bool)
+    {
+        BorrowerPosition storage position = borrowers[vault][borrower];
         if (!position.isActive) return false;
-        return !_isHealthy(borrower, true);
+        return !_isHealthy(vault, borrower, true);
     }
 
     ///  Get health factor
-    function getHealthFactor(address borrower) external view returns (uint256) {
-        BorrowerPosition storage position = borrowers[borrower];
+    function getHealthFactor(address vault, address borrower)
+        external
+        view
+        returns (uint256)
+    {
+        BorrowerPosition storage position = borrowers[vault][borrower];
         if (!position.isActive) return type(uint256).max;
 
         uint256 collateralValueUSDC = _getCollateralValue(
             position.collateralAmount
         );
         uint256 totalDebtUSDC = position.borrowedAmount +
-            _calculateBorrowerInterest(borrower);
+            _calculateBorrowerInterest(vault, borrower);
 
         if (totalDebtUSDC == 0) return type(uint256).max;
 
         return
             collateralValueUSDC.mulDiv(
-                liquidationThreshold,
+                vaultConfigs[vault].liquidationThreshold,
                 totalDebtUSDC,
                 Math.Rounding.Floor
             );
     }
 
     ///  Get collateral value in USDC (6 decimals for display)
-    function getCollateralValueInUSDC(uint256 vaultShares)
+    function getCollateralValueInUSDC(address vault, uint256 vaultShares)
         external
         view
         returns (uint256)
@@ -1206,7 +1597,11 @@ contract USDCBorrowingPoolV2 is
     }
 
     ///  Get current token price in USDC (6 decimals for display)
-    function getTokenPrice(address token) external view returns (uint256) {
+    function getTokenPrice(address vault, address token)
+        external
+        view
+        returns (uint256)
+    {
         uint256 priceIn18Decimals = _getTokenPriceInUSDC(token);
         return _fromCalculationDecimals(priceIn18Decimals);
     }
@@ -1225,7 +1620,7 @@ contract USDCBorrowingPoolV2 is
     }
 
     ///  Get underlying tokens for vault shares
-    function getUnderlyingTokens(uint256 vaultShares)
+    function getUnderlyingTokens(address vault, uint256 vaultShares)
         external
         view
         returns (uint256 tokenAAmount, uint256 tokenBAmount)
@@ -1235,11 +1630,27 @@ contract USDCBorrowingPoolV2 is
         return _calculateTokenAmountsFromLP(lpTokenAmount);
     }
 
-    ///  Withdraw protocol fees
-    function withdrawFees(uint256 amount) external onlyOwner {
-        require(amount <= accumulatedFees, "Insufficient fees");
-        accumulatedFees -= amount;
-        usdc.safeTransfer(msg.sender, amount);
+    ///  Withdraw protocol or vault fees
+    function withdrawFees(
+        address vault,
+        uint256 amount,
+        bool isProtocol
+    ) external onlyOwner {
+        if (isProtocol) {
+            require(
+                amount <= accruedProtocolFees[vault],
+                "Insufficient protocol fees"
+            );
+            accruedProtocolFees[vault] -= amount;
+            usdc.safeTransfer(protocolFeeRecipient, amount);
+        } else {
+            require(
+                amount <= accruedVaultFees[vault],
+                "Insufficient vault fees"
+            );
+            accruedVaultFees[vault] -= amount;
+            usdc.safeTransfer(vaultFeeRecipient[vault], amount);
+        }
     }
 
     ///   token recovery
@@ -1261,13 +1672,16 @@ contract USDCBorrowingPoolV2 is
         emit TokensRecovered(token, to, amount);
     }
 
-    function checker()
+    function checker(address vault)
         external
         view
         returns (bool canExec, bytes memory execPayload)
     {
         // Get liquidatable positions (max 5 for gas efficiency)
-        address[] memory liquidatablePositions = getLiquidatablePositions(5);
+        address[] memory liquidatablePositions = getLiquidatablePositions(
+            vault,
+            5
+        );
 
         if (liquidatablePositions.length > 0) {
             // Prepare execution data for batch liquidation
@@ -1282,16 +1696,17 @@ contract USDCBorrowingPoolV2 is
         }
     }
 
-    function checkerSingle()
+    function checkerSingle(address vault)
         external
         view
         returns (bool canExec, bytes memory execPayload)
     {
-        address liquidatablePosition = getFirstLiquidatablePosition();
+        address liquidatablePosition = getFirstLiquidatablePosition(vault);
 
         if (liquidatablePosition != address(0)) {
             execPayload = abi.encodeWithSelector(
                 this.liquidate.selector,
+                vault,
                 liquidatablePosition
             );
             canExec = true;
@@ -1301,93 +1716,85 @@ contract USDCBorrowingPoolV2 is
         }
     }
 
-    function getLiquidatablePositions(uint256 maxPositions)
-        public
-        view
-        returns (address[] memory liquidatable)
+    function setVaultHardcodedYield(address vault, uint256 yieldBPS)
+        external
+        onlyOwner
     {
-        if (!liquidationEnabled || activeBorrowers.length == 0) {
-            return new address[](0);
-        }
+        require(vault != address(0), "Invalid vault address");
+        require(yieldBPS <= BASIS_POINTS, "Yield too high");
+        vaultHardcodedYield[vault] = yieldBPS;
+    }
 
-        address[] memory temp = new address[](maxPositions);
-        uint256 count = 0;
-
-        for (
-            uint256 i = 0;
-            i < activeBorrowers.length && count < maxPositions;
-            i++
+    function _addActiveLender(address vault, address lender) internal {
+        if (
+            vaultLenderIndex[vault][lender] == 0 &&
+            (vaultActiveLenders[vault].length == 0 ||
+                vaultActiveLenders[vault][0] != lender)
         ) {
-            address borrower = activeBorrowers[i];
-            BorrowerPosition storage position = borrowers[borrower];
-
-            if (position.isActive && !_isHealthy(borrower, true)) {
-                temp[count] = borrower;
-                count++;
-            }
-        }
-
-        liquidatable = new address[](count);
-        for (uint256 i = 0; i < count; i++) {
-            liquidatable[i] = temp[i];
+            vaultActiveLenders[vault].push(lender);
+            vaultLenderIndex[vault][lender] = vaultActiveLenders[vault].length;
         }
     }
 
-    /// @notice Get first liquidatable position (for single liquidation strategy)
-    /// @return borrower Address of first liquidatable borrower, or address(0) if none
-    function getFirstLiquidatablePosition()
-        public
-        view
-        returns (address borrower)
+    function _removeActiveLender(address vault, address lender) internal {
+        uint256 index = vaultLenderIndex[vault][lender];
+        if (index == 0) return;
+
+        uint256 arrayIndex = index - 1;
+        uint256 lastIndex = vaultActiveLenders[vault].length - 1;
+
+        if (arrayIndex != lastIndex) {
+            address lastLender = vaultActiveLenders[vault][lastIndex];
+            vaultActiveLenders[vault][arrayIndex] = lastLender;
+            vaultLenderIndex[vault][lastLender] = index;
+        }
+
+        vaultActiveLenders[vault].pop();
+        delete vaultLenderIndex[vault][lender];
+    }
+
+    // OWNER FUNCTIONS FOR FEE RECIPIENTS AND CAPS
+    function setProtocolFeeRecipient(address recipient) external onlyOwner {
+        require(recipient != address(0), "Invalid address");
+        protocolFeeRecipient = recipient;
+    }
+
+    function setVaultFeeRecipient(address vault, address recipient)
+        external
+        onlyOwner
     {
-        if (!liquidationEnabled || activeBorrowers.length == 0) {
-            return address(0);
-        }
-
-        for (uint256 i = 0; i < activeBorrowers.length; i++) {
-            address currentBorrower = activeBorrowers[i];
-            BorrowerPosition storage position = borrowers[currentBorrower];
-
-            if (position.isActive && !_isHealthy(currentBorrower, true)) {
-                return currentBorrower;
-            }
-        }
-
-        return address(0);
+        require(
+            vault != address(0) && recipient != address(0),
+            "Invalid address"
+        );
+        vaultFeeRecipient[vault] = recipient;
     }
 
-    function getLiquidatableCount() external view returns (uint256 count) {
-        if (!liquidationEnabled) return 0;
+    function setGlobalMaxBorrow(uint256 cap) external onlyOwner {
+        globalMaxBorrow = cap;
+    }
 
-        for (uint256 i = 0; i < activeBorrowers.length; i++) {
-            address borrower = activeBorrowers[i];
-            BorrowerPosition storage position = borrowers[borrower];
+    function setVaultMaxBorrow(address vault, uint256 cap) external onlyOwner {
+        require(vault != address(0), "Invalid vault");
+        vaultMaxBorrow[vault] = cap;
+    }
 
-            if (position.isActive && !_isHealthy(borrower, true)) {
-                count++;
+    function getTotalBorrowedAllVaults() public view returns (uint256 total) {
+        for (uint256 i = 0; i < activeVaults.length; i++) {
+            address vault = activeVaults[i];
+            if (vaultConfigs[vault].active) {
+                total += vaultConfigs[vault].totalBorrowed;
             }
         }
     }
 
-    function liquidationsNeeded() external view returns (bool needed) {
-        if (!liquidationEnabled || activeBorrowers.length == 0) {
-            return false;
-        }
+    function setMaxUtilizationOnWithdraw(uint256 bps) external onlyOwner {
+        require(bps <= BASIS_POINTS, "Too high");
+        maxUtilizationOnWithdraw = bps;
+    }
 
-        uint256 checkLimit = activeBorrowers.length > 10
-            ? 10
-            : activeBorrowers.length;
-
-        for (uint256 i = 0; i < checkLimit; i++) {
-            address borrower = activeBorrowers[i];
-            BorrowerPosition storage position = borrowers[borrower];
-
-            if (position.isActive && !_isHealthy(borrower, true)) {
-                return true;
-            }
-        }
-
-        return false;
+    function setEmergencyMode(bool _emergencyMode) external onlyOwner {
+        emergencyMode = _emergencyMode;
     }
 
     fallback() external {}
