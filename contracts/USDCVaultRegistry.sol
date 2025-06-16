@@ -61,9 +61,16 @@ contract USDCVaultRegistry is Ownable(msg.sender) {
         address tokenB,
         address lpToken,
         address octoRouter,
-        address bubbleRouter
+        address bubbleRouter,
+        uint256 liquidationVaultShare,
+        uint256 liquidationProtocolShare,
+        uint256 liquidationLenderShare
     ) external onlyOwner returns (address) {
         require(vaultsByName[name] == address(0), "Vault name already exists");
+        require(
+            liquidationVaultShare + liquidationProtocolShare + liquidationLenderShare == 10000,
+            "Invalid liquidation fee distribution"
+        );
 
         address vault = factory.createVault(
             name,
@@ -86,7 +93,10 @@ contract USDCVaultRegistry is Ownable(msg.sender) {
             slippageBPS,
             lpToken,
             octoRouter,
-            bubbleRouter
+            bubbleRouter,
+            liquidationVaultShare,
+            liquidationProtocolShare,
+            liquidationLenderShare
         );
 
         vaultsByName[name] = vault;

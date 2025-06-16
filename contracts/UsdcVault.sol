@@ -45,6 +45,9 @@ contract USDCVault is
         uint256 slippageBPS;
         uint256 minBorrowAmount;
         uint256 minLiquidationAmount;
+        uint256 liquidationVaultShare;    // Added for liquidation fee distribution
+        uint256 liquidationProtocolShare; // Added for liquidation fee distribution
+        uint256 liquidationLenderShare;   // Added for liquidation fee distribution
     }
 
     struct LenderInfo {
@@ -210,7 +213,10 @@ contract USDCVault is
         uint256 _slippageBPS,
         address _lpToken,
         address _octoRouter,
-        address _bubbleRouter
+        address _bubbleRouter,
+        uint256 _liquidationVaultShare,
+        uint256 _liquidationProtocolShare,
+        uint256 _liquidationLenderShare
     ) public initializer {
         require(_usdc != address(0), "Invalid USDC address");
         require(_priceFetcher != address(0), "Invalid price fetcher address");
@@ -220,19 +226,17 @@ contract USDCVault is
         require(_tokenA != address(0), "Invalid token A address");
         require(_tokenB != address(0), "Invalid token B address");
         require(_lpToken != address(0), "Invalid LP token address");
-        require(
-            address(_octoRouter) != address(0),
-            "Invalid octo router address"
-        );
-        require(
-            address(_bubbleRouter) != address(0),
-            "Invalid bubble router address"
-        );
+        require(address(_octoRouter) != address(0), "Invalid octo router address");
+        require(address(_bubbleRouter) != address(0), "Invalid bubble router address");
         require(_maxLTV <= _liquidationThreshold, "Invalid LTV configuration");
         require(_kink <= BASIS_POINTS, "Invalid kink value");
         require(_protocolFeeRate <= BASIS_POINTS, "Invalid protocol fee rate");
         require(_lenderShare <= BASIS_POINTS, "Invalid lender share");
         require(_slippageBPS <= BASIS_POINTS, "Invalid slippage value");
+        require(
+            _liquidationVaultShare + _liquidationProtocolShare + _liquidationLenderShare == BASIS_POINTS,
+            "Invalid liquidation fee distribution"
+        );
 
         __Ownable_init(_owner);
         __ReentrancyGuard_init();
@@ -270,7 +274,10 @@ contract USDCVault is
             lenderShare: _lenderShare,
             slippageBPS: _slippageBPS,
             minBorrowAmount: 100,
-            minLiquidationAmount: 100
+            minLiquidationAmount: 100,
+            liquidationVaultShare: _liquidationVaultShare,
+            liquidationProtocolShare: _liquidationProtocolShare,
+            liquidationLenderShare: _liquidationLenderShare
         });
 
         maxUtilizationOnWithdraw = 9500; // 95% by default
@@ -684,18 +691,22 @@ contract USDCVault is
             Math.Rounding.Floor
         );
 
-        // FIXED: Better penalty distribution
+        // Use config values for liquidation penalty distribution
         uint256 vaultPenalty = penalty.mulDiv(
-            config.vaultFeeRate,
+            config.liquidationVaultShare,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
         uint256 protocolPenalty = penalty.mulDiv(
-            config.protocolFeeRate,
+            config.liquidationProtocolShare,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
-        uint256 lenderPenalty = penalty - vaultPenalty - protocolPenalty;
+        uint256 lenderPenalty = penalty.mulDiv(
+            config.liquidationLenderShare,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
 
         // Update fees
         accruedVaultFees += vaultPenalty;

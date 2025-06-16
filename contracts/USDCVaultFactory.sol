@@ -45,9 +45,12 @@ contract USDCVaultFactory is Ownable(msg.sender) {
         uint256 vaultFeeRate,
         uint256 lenderShare,
         uint256 slippageBPS,
-         address lpToken,
+        address lpToken,
         address octoRouter,
-        address bubbleRouter
+        address bubbleRouter,
+        uint256 liquidationVaultShare,
+        uint256 liquidationProtocolShare,
+        uint256 liquidationLenderShare
     ) external onlyOwner returns (address) {
         address clone = implementation.clone();
         USDCVault(clone).initialize(
@@ -71,7 +74,10 @@ contract USDCVaultFactory is Ownable(msg.sender) {
             slippageBPS,
             lpToken,
             octoRouter,
-            bubbleRouter
+            bubbleRouter,
+            liquidationVaultShare,
+            liquidationProtocolShare,
+            liquidationLenderShare
         );
 
         vaults.push(clone);
