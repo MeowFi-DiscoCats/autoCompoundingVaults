@@ -16,6 +16,7 @@ import "./vaultV1uups.sol";
 import "./bubbleFiABI.sol";
 import "./uniswaphelper.sol";
 
+
 contract USDCVault is
     Initializable,
     ReentrancyGuardUpgradeable,
@@ -65,6 +66,8 @@ contract USDCVault is
         uint256 accruedInterest;
         bool isActive;
     }
+
+    //exchange->
 
     IPawUSDC public pawUSDC;
     IBubbleVault public bubbleVault;
@@ -188,6 +191,7 @@ contract USDCVault is
     event VaultHardcodedYieldUpdated(uint256 oldValue, uint256 newValue);
     event MaxBorrowUpdated(uint256 oldValue, uint256 newValue);
 
+
     constructor() {
         _disableInitializers();
     }
@@ -255,6 +259,9 @@ contract USDCVault is
         tokenA = IERC20(_tokenA);
         tokenB = IERC20(_tokenB);
         lpToken = IERC20(_lpToken);
+        octoRouter=IOctoswapRouter02(_octoRouter);
+        bubbleRouter=IBubbleV1Router(payable(_bubbleRouter));
+
 
         config = VaultConfig({
             maxLTV: _maxLTV,
@@ -375,18 +382,18 @@ contract USDCVault is
         _accrueInterest();
 
         LenderInfo storage lender = lenders[msg.sender];
-        if (lender.depositAmount > 0) {
+            if (lender.depositAmount > 0) {
             _updateLenderInterest(msg.sender);
         } else {
-            // Initialize interest index for new lender
+            // Initialize new lender
             lenderInterestIndex[msg.sender] = globalLenderInterestIndex;
+            _addActiveLender(msg.sender);
         }
 
         lender.depositAmount += amount;
         lender.lastUpdateTime = block.timestamp;
         config.totalLent += amount;
 
-        _addActiveLender(msg.sender);
 
         usdc.safeTransferFrom(msg.sender, address(this), amount);
 
@@ -426,17 +433,17 @@ contract USDCVault is
 
         // Withdrawal control: check utilization after withdrawal
         uint256 newTotalLent = config.totalLent - amount;
-        uint256 utilizationAfter = newTotalLent == 0
-            ? 0
-            : config.totalBorrowed.mulDiv(
+        if (newTotalLent > 0 && config.totalBorrowed > 0) {
+            uint256 utilizationAfter = config.totalBorrowed.mulDiv(
                 BASIS_POINTS,
                 newTotalLent,
-                Math.Rounding.Floor
+                Math.Rounding.Ceil
             );
-        require(
-            utilizationAfter <= maxUtilizationOnWithdraw,
-            "Utilization too high after withdrawal"
-        );
+            require(
+                utilizationAfter <= maxUtilizationOnWithdraw,
+                "Utilization too high after withdrawal"
+            );
+        }
 
         // Update lender state
         lender.depositAmount -= amount;
@@ -702,11 +709,7 @@ contract USDCVault is
             BASIS_POINTS,
             Math.Rounding.Floor
         );
-        uint256 lenderPenalty = penalty.mulDiv(
-            config.liquidationLenderShare,
-            BASIS_POINTS,
-            Math.Rounding.Floor
-        );
+        uint256 lenderPenalty = penalty - vaultPenalty - protocolPenalty;
 
         // Update fees
         accruedVaultFees += vaultPenalty;
@@ -1136,6 +1139,9 @@ contract USDCVault is
         return
             utilization.mulDiv(rateToPool, BASIS_POINTS, Math.Rounding.Floor);
     }
+
+    // getcollatertral value in usdc 
+    
 
     function _isHealthy(
         address borrower,
