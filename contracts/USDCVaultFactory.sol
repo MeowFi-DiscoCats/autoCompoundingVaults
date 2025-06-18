@@ -92,7 +92,7 @@ contract USDCVaultFactory is Ownable(msg.sender) {
             block.timestamp
         );
 
-        return clone;
+        return clone; 
     }
 
     function getVaults() external view returns (address[] memory) {
