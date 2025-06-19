@@ -3,15 +3,30 @@ pragma solidity ^0.8.25;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
+    using Math for uint256;
+    
     address public borrowingPool;
+    
+    // Interest-bearing mechanism
+    uint256 public exchangeRate; // Exchange rate between PawUSDC and USDC (scaled by 1e18)
+    uint256 public totalUnderlying; // Total USDC underlying all PawUSDC tokens
+    uint256 public lastUpdateTime;
+    
+    uint256 public constant INITIAL_EXCHANGE_RATE = 1e18; // 1:1 initial rate
+    uint256 public constant BASIS_POINTS = 10000;
+    
+    event ExchangeRateUpdated(uint256 oldRate, uint256 newRate, uint256 timestamp);
+    event InterestAccrued(uint256 amount, uint256 newExchangeRate, uint256 timestamp);
     
     function initialize() public initializer {
         __ERC20_init("pawUSDC", "pawUSDC");
         __Ownable_init(msg.sender);
+        exchangeRate = INITIAL_EXCHANGE_RATE;
+        lastUpdateTime = block.timestamp;
     }
-
 
     function decimals() public pure override returns (uint8) {
         return 6;
@@ -26,12 +41,87 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         _;
     }
     
-    function mint(address to, uint256 amount) external onlyPool {
-        _mint(to, amount);
+    // Convert USDC amount to PawUSDC amount using current exchange rate
+    function usdcToPawUSDC(uint256 usdcAmount) public view returns (uint256) {
+        if (exchangeRate == 0) return usdcAmount;
+        return usdcAmount.mulDiv(1e18, exchangeRate, Math.Rounding.Floor);
     }
     
-    function burn(address from, uint256 amount) external onlyPool {
-        _burn(from, amount);
+    // Convert PawUSDC amount to USDC amount using current exchange rate
+    function pawUSDCToUSDC(uint256 pawUSDCAmount) public view returns (uint256) {
+        return pawUSDCAmount.mulDiv(exchangeRate, 1e18, Math.Rounding.Floor);
+    }
+    
+    // Accrue interest and update exchange rate
+    function accrueInterest(uint256 interestAmount) external onlyPool {
+        require(interestAmount > 0, "Interest amount must be positive");
+        require(totalSupply() > 0, "No tokens minted yet");
+        
+        uint256 oldExchangeRate = exchangeRate;
+        
+        // Update total underlying
+        totalUnderlying += interestAmount;
+        
+        // Calculate new exchange rate
+        // New rate = (Total underlying) / (Total PawUSDC supply)
+        exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
+        
+        lastUpdateTime = block.timestamp;
+        
+        emit InterestAccrued(interestAmount, exchangeRate, block.timestamp);
+        emit ExchangeRateUpdated(oldExchangeRate, exchangeRate, block.timestamp);
+    }
+    
+    // Mint PawUSDC tokens based on USDC deposit
+    function mint(address to, uint256 usdcAmount) external onlyPool {
+        require(usdcAmount > 0, "Amount must be positive");
+        
+        uint256 pawUSDCAmount = usdcToPawUSDC(usdcAmount);
+        require(pawUSDCAmount > 0, "Invalid PawUSDC amount");
+        
+        _mint(to, pawUSDCAmount);
+        totalUnderlying += usdcAmount;
+        
+        // Update exchange rate after minting
+        if (totalSupply() > 0) {
+            exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
+        }
+    }
+    
+    // Burn PawUSDC tokens and return USDC based on current exchange rate
+    function burn(address from, uint256 pawUSDCAmount) external onlyPool {
+        require(pawUSDCAmount > 0, "Amount must be positive");
+        require(balanceOf(from) >= pawUSDCAmount, "Insufficient balance");
+        
+        uint256 usdcAmount = pawUSDCToUSDC(pawUSDCAmount);
+        require(usdcAmount > 0, "Invalid USDC amount");
+        
+        _burn(from, pawUSDCAmount);
+        totalUnderlying -= usdcAmount;
+        
+        // Update exchange rate after burning
+        if (totalSupply() > 0) {
+            exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
+        } else {
+            // If no tokens left, reset to initial rate
+            exchangeRate = INITIAL_EXCHANGE_RATE;
+            totalUnderlying = 0;
+        }
+    }
+    
+    // Get current exchange rate
+    function getExchangeRate() external view returns (uint256) {
+        return exchangeRate;
+    }
+    
+    // Get total underlying USDC
+    function getTotalUnderlying() external view returns (uint256) {
+        return totalUnderlying;
+    }
+    
+    // Get user's underlying USDC balance
+    function getUnderlyingBalance(address user) external view returns (uint256) {
+        return pawUSDCToUSDC(balanceOf(user));
     }
 }
 // usdc=0xf817257fed379853cDe0fa4F97AB987181B1E5Ea

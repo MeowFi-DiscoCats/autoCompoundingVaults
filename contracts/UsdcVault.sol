@@ -12,6 +12,7 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "./interfaces/IPawUsdc.sol";
 import "./interfaces/IBubbleVault.sol";
 import "./interfaces/IMonadPriceFetcher.sol";
+import "./interfaces/ICentralizedLendingPool.sol";
 import "./vaultV1uups.sol";
 import "./bubbleFiABI.sol";
 import "./uniswaphelper.sol";
@@ -51,14 +52,6 @@ contract USDCVault is
         uint256 liquidationLenderShare;   // Added for liquidation fee distribution
     }
 
-    struct LenderInfo {
-        uint256 depositAmount;
-        uint256 lastUpdateTime;
-        uint256 accruedInterest;
-        uint256 pawUSDCAmount;
-        uint256 interestIndex;
-    }
-
     struct BorrowerPosition {
         uint256 collateralAmount;
         uint256 borrowedAmount;
@@ -73,6 +66,7 @@ contract USDCVault is
     IBubbleVault public bubbleVault;
     IERC20 public usdc;
     IMonadPriceFetcher public priceFetcher;
+    ICentralizedLendingPool public lendingPool;
 
     address public constant USDC_ADDRESS =
         0xf817257fed379853cDe0fa4F97AB987181B1E5Ea;
@@ -96,23 +90,18 @@ contract USDCVault is
 
     // State variables
     VaultConfig public config;
-    mapping(address => LenderInfo) public lenders;
     mapping(address => BorrowerPosition) public borrowers;
     address[] public activeBorrowers;
     mapping(address => uint256) public borrowerIndex;
-    address[] public activeLenders;
-    mapping(address => uint256) public lenderIndex;
     uint256 public vaultInterestIndex;
-    mapping(address => uint256) public lenderInterestIndex;
+    uint256 public lastAccrualTime;
+    uint256 public counter;
 
     IERC20 public tokenA;
     IERC20 public tokenB;
     IERC20 public lpToken;
     IOctoswapRouter02 public octoRouter;
     IBubbleV1Router public bubbleRouter;
-
-    uint256 public lastAccrualTime;
-    uint256 public counter;
 
     uint256 public accumulatedFees;
     bool public liquidationEnabled;
@@ -129,23 +118,7 @@ contract USDCVault is
     uint256 public maxUtilizationOnWithdraw;
     uint256 public vaultHardcodedYield; // Added for yield-based rate calculation
 
-    // NEW: Track lender interest distribution
-    uint256 public totalLenderInterest;
-    uint256 public globalLenderInterestIndex;
-
     // Events
-    event LentUSDC(
-        address indexed lender,
-        uint256 amount,
-        uint256 pawUSDCAmount,
-        uint256 timestamp
-    );
-    event WithdrewUSDC(
-        address indexed lender,
-        uint256 amount,
-        uint256 interest,
-        uint256 timestamp
-    );
     event Borrowed(
         address indexed borrower,
         uint256 collateral,
@@ -190,7 +163,9 @@ contract USDCVault is
     event MaxUtilizationOnWithdrawUpdated(uint256 oldValue, uint256 newValue);
     event VaultHardcodedYieldUpdated(uint256 oldValue, uint256 newValue);
     event MaxBorrowUpdated(uint256 oldValue, uint256 newValue);
+    event LendingPoolUpdated(address indexed oldPool, address indexed newPool);
 
+    uint256 public totalLiquidatedUSDC;
 
     constructor() {
         _disableInitializers();
@@ -220,7 +195,8 @@ contract USDCVault is
         address _bubbleRouter,
         uint256 _liquidationVaultShare,
         uint256 _liquidationProtocolShare,
-        uint256 _liquidationLenderShare
+        uint256 _liquidationLenderShare,
+        address _lendingPool
     ) public initializer {
         require(_usdc != address(0), "Invalid USDC address");
         require(_priceFetcher != address(0), "Invalid price fetcher address");
@@ -232,6 +208,7 @@ contract USDCVault is
         require(_lpToken != address(0), "Invalid LP token address");
         require(address(_octoRouter) != address(0), "Invalid octo router address");
         require(address(_bubbleRouter) != address(0), "Invalid bubble router address");
+        require(_lendingPool != address(0), "Invalid lending pool address");
         require(_maxLTV <= _liquidationThreshold, "Invalid LTV configuration");
         require(_kink <= BASIS_POINTS, "Invalid kink value");
         require(_protocolFeeRate <= BASIS_POINTS, "Invalid protocol fee rate");
@@ -251,17 +228,16 @@ contract USDCVault is
         priceFetcher = IMonadPriceFetcher(_priceFetcher);
         pawUSDC = IPawUSDC(_pawUSDC);
         bubbleVault = IBubbleVault(_bubbleVault);
+        lendingPool = ICentralizedLendingPool(_lendingPool);
         lastAccrualTime = block.timestamp;
         counter = 0;
         vaultInterestIndex = 1e18; // Initialize to 1
-        globalLenderInterestIndex = 0;
 
         tokenA = IERC20(_tokenA);
         tokenB = IERC20(_tokenB);
         lpToken = IERC20(_lpToken);
         octoRouter=IOctoswapRouter02(_octoRouter);
         bubbleRouter=IBubbleV1Router(payable(_bubbleRouter));
-
 
         config = VaultConfig({
             maxLTV: _maxLTV,
@@ -344,136 +320,23 @@ contract USDCVault is
         delete borrowerIndex[borrower];
     }
 
-    function _addActiveLender(address lender) internal {
-        if (
-            lenderIndex[lender] == 0 &&
-            (activeLenders.length == 0 || activeLenders[0] != lender)
-        ) {
-            activeLenders.push(lender);
-            lenderIndex[lender] = activeLenders.length;
-        }
-    }
-
-    function _removeActiveLender(address lender) internal {
-        uint256 index = lenderIndex[lender];
-        if (index == 0) return;
-
-        uint256 arrayIndex = index - 1;
-        uint256 lastIndex = activeLenders.length - 1;
-
-        if (arrayIndex != lastIndex) {
-            address lastLender = activeLenders[lastIndex];
-            activeLenders[arrayIndex] = lastLender;
-            lenderIndex[lastLender] = index;
-        }
-
-        activeLenders.pop();
-        delete lenderIndex[lender];
-    }
-
-    // CORE FUNCTIONS
-    function lendUSDC(
-        uint256 amount
-    ) external nonReentrant validAmount(amount) notInEmergencyMode {
+    // CORE FUNCTIONS - LENDING DELEGATED TO CENTRALIZED POOL
+    function lendUSDC(uint256 amount) external nonReentrant validAmount(amount) notInEmergencyMode {
         require(amount >= MIN_DEPOSIT_AMOUNT, "Amount too small");
         require(amount <= MAX_DEPOSIT_AMOUNT, "Amount too large");
         require(config.active, "Vault not active");
 
-        _accrueInterest();
-
-        LenderInfo storage lender = lenders[msg.sender];
-            if (lender.depositAmount > 0) {
-            _updateLenderInterest(msg.sender);
-        } else {
-            // Initialize new lender
-            lenderInterestIndex[msg.sender] = globalLenderInterestIndex;
-            _addActiveLender(msg.sender);
-        }
-
-        lender.depositAmount += amount;
-        lender.lastUpdateTime = block.timestamp;
-        config.totalLent += amount;
-
-
-        usdc.safeTransferFrom(msg.sender, address(this), amount);
-
-        // Mint PawUSDC to lender
-        pawUSDC.mint(msg.sender, amount);
-        lender.pawUSDCAmount += amount;
-
-        emit LentUSDC(msg.sender, amount, amount, block.timestamp);
+        // Delegate lending to centralized pool
+        usdc.safeTransferFrom(msg.sender, address(lendingPool), amount);
+        lendingPool.deposit(msg.sender, amount, address(this));
     }
 
-    function withdrawUSDC(
-        uint256 amount
-    ) external nonReentrant notInEmergencyMode {
-        LenderInfo storage lender = lenders[msg.sender];
-        require(lender.depositAmount > 0, "No deposit found");
-
-        _accrueInterest();
-        _updateLenderInterest(msg.sender);
-
-        if (amount == 0) {
-            amount = lender.depositAmount;
-        }
-        require(amount <= lender.depositAmount, "Insufficient deposit");
-
-        // Calculate interest to withdraw proportionally
-        uint256 interestToWithdraw = lender.accruedInterest.mulDiv(
-            amount,
-            lender.depositAmount,
-            Math.Rounding.Floor
-        );
-
-        uint256 totalWithdraw = amount + interestToWithdraw;
-        require(
-            usdc.balanceOf(address(this)) >= totalWithdraw,
-            "Insufficient liquidity"
-        );
-
-        // Withdrawal control: check utilization after withdrawal
-        uint256 newTotalLent = config.totalLent - amount;
-        if (newTotalLent > 0 && config.totalBorrowed > 0) {
-            uint256 utilizationAfter = config.totalBorrowed.mulDiv(
-                BASIS_POINTS,
-                newTotalLent,
-                Math.Rounding.Ceil
-            );
-            require(
-                utilizationAfter <= maxUtilizationOnWithdraw,
-                "Utilization too high after withdrawal"
-            );
-        }
-
-        // Update lender state
-        lender.depositAmount -= amount;
-        lender.accruedInterest -= interestToWithdraw;
-        lender.lastUpdateTime = block.timestamp;
-
-        // Update vault state
-        config.totalLent -= amount;
-        totalLenderInterest -= interestToWithdraw;
-
-        // Remove from active lenders if fully withdrawn
-        if (lender.depositAmount == 0) {
-            _removeActiveLender(msg.sender);
-        }
-
-        // Burn PawUSDC tokens
-        pawUSDC.burn(msg.sender, amount);
-        lender.pawUSDCAmount -= amount;
-
-        // Move the transfer to the end after all state changes
-        usdc.safeTransfer(msg.sender, totalWithdraw);
-
-        emit WithdrewUSDC(
-            msg.sender,
-            amount,
-            interestToWithdraw,
-            block.timestamp
-        );
+    function withdrawUSDC(uint256 amount) external nonReentrant notInEmergencyMode {
+        // Delegate withdrawal to centralized pool
+        lendingPool.withdraw(msg.sender, amount, address(this));
     }
 
+    // BORROWING FUNCTIONS - REMAIN VAULT-SPECIFIC
     function borrow(
         uint256 collateralAmount,
         uint256 borrowAmount
@@ -486,9 +349,11 @@ contract USDCVault is
     {
         require(config.active, "Vault not active");
         require(config.borrowingEnabled, "Borrowing disabled");
+        
+        // Check if centralized pool has sufficient liquidity
         require(
-            usdc.balanceOf(address(this)) >= borrowAmount,
-            "Insufficient liquidity"
+            lendingPool.getAvailableLiquidity() >= borrowAmount,
+            "Insufficient liquidity in lending pool"
         );
 
         _accrueInterest();
@@ -565,7 +430,10 @@ contract USDCVault is
         config.totalCollateral += collateralAmount;
         config.totalBorrowed += borrowAmount;
 
+        // Borrow from centralized pool
+        lendingPool.borrow(address(this), borrowAmount);
         usdc.safeTransfer(msg.sender, borrowAmount);
+        
         emit Borrowed(
             msg.sender,
             collateralAmount,
@@ -602,13 +470,24 @@ contract USDCVault is
 
         // FIXED: Proper fee distribution for interest payments
         if (interestPaid > 0) {
+            // Get vault-specific fee rates from lending pool
+            (
+                , // baseRate
+                , // multiplier
+                , // jumpMultiplier
+                , // kink
+                uint256 lenderShare,
+                uint256 vaultFeeRate,
+                uint256 protocolFeeRate
+            ) = lendingPool.getVaultInterestRate(address(this));
+
             uint256 vaultFee = interestPaid.mulDiv(
-                config.vaultFeeRate,
+                vaultFeeRate,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
             uint256 protocolFee = interestPaid.mulDiv(
-                config.protocolFeeRate,
+                protocolFeeRate,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
@@ -618,14 +497,9 @@ contract USDCVault is
             accruedVaultFees += vaultFee;
             accruedProtocolFees += protocolFee;
 
-            // Distribute to lenders through interest index
-            if (lenderInterest > 0 && config.totalLent > 0) {
-                totalLenderInterest += lenderInterest;
-                globalLenderInterestIndex += lenderInterest.mulDiv(
-                    1e18,
-                    config.totalLent,
-                    Math.Rounding.Floor
-                );
+            // Send lender interest to centralized pool
+            if (lenderInterest > 0) {
+                lendingPool.distributeInterest(lenderInterest);
             }
         }
 
@@ -649,6 +523,9 @@ contract USDCVault is
 
         // Update pool state
         config.totalBorrowed -= principalPaid;
+
+        // Repay to centralized pool
+        lendingPool.repay(address(this), principalPaid);
 
         // Return collateral if fully repaid
         if (collateralToReturn > 0) {
@@ -691,6 +568,9 @@ contract USDCVault is
         uint256 usdcRecovered = _liquidateCollateral(collateralToLiquidate);
         require(usdcRecovered > 0, "Liquidation failed");
 
+        // Track vault-specific total liquidated amount
+        totalLiquidatedUSDC += usdcRecovered;
+
         // Calculate liquidation penalty
         uint256 penalty = usdcRecovered.mulDiv(
             config.liquidationPenalty,
@@ -715,14 +595,9 @@ contract USDCVault is
         accruedVaultFees += vaultPenalty;
         accruedProtocolFees += protocolPenalty;
 
-        // Distribute lender penalty through interest index
-        if (lenderPenalty > 0 && config.totalLent > 0) {
-            totalLenderInterest += lenderPenalty;
-            globalLenderInterestIndex += lenderPenalty.mulDiv(
-                1e18,
-                config.totalLent,
-                Math.Rounding.Floor
-            );
+        // Send lender penalty to centralized pool
+        if (lenderPenalty > 0) {
+            lendingPool.distributeInterest(lenderPenalty);
         }
 
         // Calculate debt repayment
@@ -746,6 +621,9 @@ contract USDCVault is
         config.totalCollateral -= collateralToLiquidate;
 
         _removeActiveBorrower(borrower);
+
+        // Repay to centralized pool
+        lendingPool.repay(address(this), principalRepaid);
 
         counter = counter + 1;
         emit Liquidated(
@@ -785,27 +663,6 @@ contract USDCVault is
         position.lastUpdateTime = block.timestamp;
     }
 
-    function _updateLenderInterest(address lender) internal {
-        LenderInfo storage info = lenders[lender];
-        if (info.depositAmount == 0) return;
-
-        uint256 currentIndex = globalLenderInterestIndex;
-        uint256 lastIndex = lenderInterestIndex[lender];
-
-        if (currentIndex > lastIndex) {
-            uint256 indexDelta = currentIndex - lastIndex;
-            uint256 interestAccrued = info.depositAmount.mulDiv(
-                indexDelta,
-                1e18,
-                Math.Rounding.Floor
-            );
-            info.accruedInterest += interestAccrued;
-        }
-
-        lenderInterestIndex[lender] = currentIndex;
-        info.lastUpdateTime = block.timestamp;
-    }
-
     function _accrueInterest() internal {
         uint256 timeElapsed = block.timestamp - lastAccrualTime;
         if (timeElapsed == 0) return;
@@ -834,13 +691,24 @@ contract USDCVault is
 
         // Distribute generated interest
         if (totalInterestGenerated > 0) {
+            // Get vault-specific fee rates from lending pool
+            (
+                , // baseRate
+                , // multiplier
+                , // jumpMultiplier
+                , // kink
+                uint256 lenderShare,
+                uint256 vaultFeeRate,
+                uint256 protocolFeeRate
+            ) = lendingPool.getVaultInterestRate(address(this));
+
             uint256 vaultFee = totalInterestGenerated.mulDiv(
-                config.vaultFeeRate,
+                vaultFeeRate,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
             uint256 protocolFee = totalInterestGenerated.mulDiv(
-                config.protocolFeeRate,
+                protocolFeeRate,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
@@ -852,14 +720,9 @@ contract USDCVault is
             accruedVaultFees += vaultFee;
             accruedProtocolFees += protocolFee;
 
-            // Update lender interest index
-            if (lenderInterest > 0 && config.totalLent > 0) {
-                totalLenderInterest += lenderInterest;
-                globalLenderInterestIndex += lenderInterest.mulDiv(
-                    1e18,
-                    config.totalLent,
-                    Math.Rounding.Floor
-                );
+            // Send lender interest to centralized pool
+            if (lenderInterest > 0) {
+                lendingPool.distributeInterest(lenderInterest);
             }
         }
 
@@ -1079,11 +942,12 @@ contract USDCVault is
 
     // VIEW FUNCTIONS
     function getUtilizationRate() public view returns (uint256) {
-        if (config.totalLent == 0) return 0;
+        uint256 totalLent = lendingPool.getTotalDeposits();
+        if (totalLent == 0) return 0;
         return
             config.totalBorrowed.mulDiv(
                 BASIS_POINTS,
-                config.totalLent,
+                totalLent,
                 Math.Rounding.Floor
             );
     }
@@ -1093,32 +957,43 @@ contract USDCVault is
 
         uint256 utilization = getUtilizationRate();
 
+        // Get vault-specific interest rate configuration from lending pool
+        (
+            uint256 baseRate,
+            uint256 multiplier,
+            uint256 jumpMultiplier,
+            uint256 kink,
+            , // lenderShare - not needed for borrow rate calculation
+            , // vaultFeeRate - not needed for borrow rate calculation
+            // protocolFeeRate - not needed for borrow rate calculation
+        ) = lendingPool.getVaultInterestRate(address(this));
+
         uint256 yieldGenerated = (vaultHardcodedYield > 0)
             ? vaultHardcodedYield
             : DEFAULT_BASE_RATE;
 
-        uint256 baseBorrowRate = yieldGenerated / 3;
+        uint256 actualBaseRate = (baseRate > 0) ? baseRate : yieldGenerated / 3;
 
-        if (utilization <= config.kink) {
-            // Below kink: linear scale of baseBorrowRate by utilization
+        if (utilization <= kink) {
+            // Below kink: linear scale of baseRate by utilization
             return
-                baseBorrowRate.mulDiv(
+                actualBaseRate.mulDiv(
                     utilization,
                     BASIS_POINTS,
                     Math.Rounding.Floor
                 );
         } else {
             // Above kink: normal rate at kink + jump rate for excess utilization
-            uint256 normalRateAtKink = baseBorrowRate.mulDiv(
-                config.kink,
+            uint256 normalRateAtKink = actualBaseRate.mulDiv(
+                kink,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
 
-            uint256 excessUtil = utilization - config.kink;
+            uint256 excessUtil = utilization - kink;
 
             uint256 jumpRate = excessUtil.mulDiv(
-                config.jumpMultiplier,
+                jumpMultiplier,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
@@ -1131,17 +1006,25 @@ contract USDCVault is
         uint256 utilization = getUtilizationRate();
         uint256 borrowRate = getBorrowRate();
 
+        // Get vault-specific lender share from lending pool
+        (
+            , // baseRate
+            , // multiplier
+            , // jumpMultiplier
+            , // kink
+            uint256 lenderShare,
+            , // vaultFeeRate
+            // protocolFeeRate
+        ) = lendingPool.getVaultInterestRate(address(this));
+
         uint256 rateToPool = borrowRate.mulDiv(
-            config.lenderShare,
+            lenderShare,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
         return
             utilization.mulDiv(rateToPool, BASIS_POINTS, Math.Rounding.Floor);
     }
-
-    // getcollatertral value in usdc 
-    
 
     function _isHealthy(
         address borrower,
@@ -1173,6 +1056,13 @@ contract USDCVault is
     }
 
     // ADMIN FUNCTIONS
+    function setLendingPool(address _lendingPool) external onlyOwner {
+        require(_lendingPool != address(0), "Invalid lending pool address");
+        address oldPool = address(lendingPool);
+        lendingPool = ICentralizedLendingPool(_lendingPool);
+        emit LendingPoolUpdated(oldPool, _lendingPool);
+    }
+
     function setLiquidationEnabled(bool _enabled) external onlyOwner {
         liquidationEnabled = _enabled;
     }
@@ -1259,5 +1149,54 @@ contract USDCVault is
 
     function version() external pure returns (string memory) {
         return "1.0.0";
+    }
+
+    // ======== FRONTEND VIEW FUNCTIONS ========
+
+    /// @notice Get the USDC value of a given amount of vault shares (collateral)
+    /// @param collateralAmount Amount of vault shares
+    /// @return valueInUSDC Value in USDC (6 decimals)
+    function getCollateralValueInUSDC(uint256 collateralAmount) external view returns (uint256 valueInUSDC) {
+        return _getCollateralValue(collateralAmount);
+    }
+
+    function getPawUSDCHolderInfo(address user) external view returns (
+        uint256 pawUSDCBalance,
+        uint256 underlyingUSDC,
+        uint256 exchangeRate
+    ) {
+        pawUSDCBalance = pawUSDC.balanceOf(user);
+        exchangeRate = pawUSDC.getExchangeRate();
+        underlyingUSDC = pawUSDC.pawUSDCToUSDC(pawUSDCBalance);
+    }
+
+    /// @notice Get vault TVL (total collateral value in USDC)
+    function getVaultTVL() external view returns (uint256 tvlUSDC) {
+        return _getCollateralValue(config.totalCollateral);
+    }
+
+    /// @notice Get total yield generated by this vault (interest sent to pool, in USDC)
+    function getVaultYieldGenerated() external view returns (uint256 yieldUSDC) {
+        return lendingPool.getVaultTotalInterestPaid(address(this));
+    }
+
+    /// @notice Get total lending interest earned by a user (in USDC)
+    function getLendingInterest(address user) external view returns (uint256 interestUSDC) {
+        return lendingPool.getLenderInterest(user);
+    }
+
+    /// @notice Get total amount liquidated in this vault (in USDC)
+    function getTotalLiquidatedAmount() external view returns (uint256) {
+        return totalLiquidatedUSDC;
+    }
+
+    /// @notice Get total protocol and vault fees accrued (in USDC)
+    function getRedemptionFees() external view returns (uint256 protocolFees, uint256 vaultFees) {
+        return (accruedProtocolFees, accruedVaultFees);
+    }
+
+    /// @notice Get total interest ever distributed to all lenders (in USDC)
+    function getTotalInterestDistributed() external view returns (uint256) {
+        return lendingPool.getTotalInterestDistributed();
     }
 }

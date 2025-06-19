@@ -13,6 +13,8 @@ contract USDCVaultFactory is Ownable(msg.sender) {
     mapping(address => bool) public isVault;
     mapping(address => string) public vaultNames;
 
+
+
     event VaultCreated(
         address indexed vault,
         string name,
@@ -50,7 +52,8 @@ contract USDCVaultFactory is Ownable(msg.sender) {
         address bubbleRouter,
         uint256 liquidationVaultShare,
         uint256 liquidationProtocolShare,
-        uint256 liquidationLenderShare
+        uint256 liquidationLenderShare,
+        address lendingPool
     ) external onlyOwner returns (address) {
         address clone = implementation.clone();
         USDCVault(clone).initialize(
@@ -77,7 +80,8 @@ contract USDCVaultFactory is Ownable(msg.sender) {
             bubbleRouter,
             liquidationVaultShare,
             liquidationProtocolShare,
-            liquidationLenderShare
+            liquidationLenderShare,
+            lendingPool
         );
 
         vaults.push(clone);
@@ -92,7 +96,7 @@ contract USDCVaultFactory is Ownable(msg.sender) {
             block.timestamp
         );
 
-        return clone; 
+        return clone; //
     }
 
     function getVaults() external view returns (address[] memory) {
@@ -110,5 +114,13 @@ contract USDCVaultFactory is Ownable(msg.sender) {
             }
         }
         return address(0);
+    }
+
+    function getGlobalTotalLiquidatedAmount() external view returns (uint256) {
+        uint256 total = 0;
+        for (uint256 i = 0; i < vaults.length; i++) {
+            total += USDCVault(vaults[i]).totalLiquidatedUSDC();
+        }
+        return total;
     }
 } 
