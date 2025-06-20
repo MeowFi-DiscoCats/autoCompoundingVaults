@@ -89,7 +89,7 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
     event InterestDistributed(
         address indexed vault,
         uint256 amount,
-        uint256 lenderShare,
+        uint256 lenderInterest,
         uint256 vaultFee,
         uint256 protocolFee,
         uint256 timestamp
@@ -168,26 +168,29 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         require(vaults[vault].isActive, "Vault not registered");
         
         LenderInfo storage lenderInfo = lenders[lender];
-        require(lenderInfo.depositAmount > 0, "No deposit found");
+        require(lenderInfo.pawUSDCAmount > 0, "No deposit found");
 
+        uint256 maxWithdrawable = pawUSDC.pawUSDCToUSDC(lenderInfo.pawUSDCAmount);
         if (amount == 0) {
-            amount = lenderInfo.depositAmount;
+            amount = maxWithdrawable;
         }
-        require(amount <= lenderInfo.depositAmount, "Insufficient deposit");
+        require(amount <= maxWithdrawable, "Withdraw amount exceeds balance");
 
-        // Calculate how much PawUSDC to burn based on current exchange rate
-        uint256 pawUSDCToBurn = pawUSDC.usdcToPawUSDC(amount);
-        require(pawUSDCToBurn <= lenderInfo.pawUSDCAmount, "Insufficient PawUSDC balance");
-
-        // Calculate total USDC to withdraw (including interest via exchange rate)
-        uint256 totalUSDCToWithdraw = pawUSDC.pawUSDCToUSDC(pawUSDCToBurn);
+        // Calculate how much PawUSDC to burn.
+        // We burn a proportional amount of their pawUSDC to get the requested USDC amount.
+        uint256 pawUSDCToBurn = lenderInfo.pawUSDCAmount.mulDiv(amount, maxWithdrawable, Math.Rounding.Ceil);
+        
+        // This is a sanity check, the actual amount transferred is `amount`
+        uint256 totalUSDCToWithdraw = amount; 
         require(
             usdc.balanceOf(address(this)) >= totalUSDCToWithdraw,
             "Insufficient liquidity"
         );
 
         // Withdrawal control: check utilization after withdrawal
-        uint256 newTotalDeposits = totalDeposits - amount;
+        // Note: `totalDeposits` tracks principal, so we need to calculate principal withdrawn
+        uint256 principalWithdrawn = Math.min(lenderInfo.depositAmount, amount);
+        uint256 newTotalDeposits = totalDeposits - principalWithdrawn;
         if (newTotalDeposits > 0 && totalBorrowed > 0) {
             uint256 utilizationAfter = totalBorrowed.mulDiv(
                 BASIS_POINTS,
@@ -201,15 +204,15 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         }
 
         // Update lender state
-        lenderInfo.depositAmount -= amount;
+        lenderInfo.depositAmount -= principalWithdrawn;
         lenderInfo.pawUSDCAmount -= pawUSDCToBurn;
         lenderInfo.lastUpdateTime = block.timestamp;
 
         // Update pool state
-        totalDeposits -= amount;
+        totalDeposits -= principalWithdrawn;
 
         // Remove from active lenders if fully withdrawn
-        if (lenderInfo.depositAmount == 0) {
+        if (lenderInfo.pawUSDCAmount == 0) {
             _removeActiveLender(lender);
         }
 
@@ -219,8 +222,8 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         // Transfer USDC to lender
         usdc.safeTransfer(lender, totalUSDCToWithdraw);
 
-        uint256 interestEarned = totalUSDCToWithdraw - amount;
-        emit WithdrewUSDC(lender, amount, interestEarned, block.timestamp);
+        uint256 interestEarned = totalUSDCToWithdraw > principalWithdrawn ? totalUSDCToWithdraw - principalWithdrawn : 0;
+        emit WithdrewUSDC(lender, totalUSDCToWithdraw, interestEarned, block.timestamp);
     }
 
     function borrow(
@@ -256,7 +259,7 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         emit VaultRepaid(vault, amount, block.timestamp);
     }
 
-    function distributeInterest(uint256 amount) external override nonReentrant {
+    function distributeInterest(uint256 amount) external override onlyRegisteredVault nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
         require(totalDeposits > 0, "No deposits to distribute to");
 
@@ -267,18 +270,8 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         // Transfer interest from sender
         usdc.safeTransferFrom(msg.sender, address(this), amount);
 
-        // Calculate fee distribution based on vault configuration
-        uint256 vaultFee = amount.mulDiv(
-            rateConfig.vaultFeeRate,
-            BASIS_POINTS,
-            Math.Rounding.Floor
-        );
-        uint256 protocolFee = amount.mulDiv(
-            rateConfig.protocolFeeRate,
-            BASIS_POINTS,
-            Math.Rounding.Floor
-        );
-        uint256 lenderInterest = amount - vaultFee - protocolFee;
+        // This amount is pure lender interest (vault and protocol fees already handled by vault)
+        uint256 lenderInterest = amount;
 
         // Update vault's total interest paid
         vaults[msg.sender].totalInterestPaid += amount;
@@ -289,17 +282,12 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
             totalInterestDistributed += lenderInterest;
         }
 
-        // Transfer fees to recipients (vault can handle its own fee distribution)
-        if (protocolFee > 0 && protocolFeeRecipient != address(0)) {
-            usdc.safeTransfer(protocolFeeRecipient, protocolFee);
-        }
-
         emit InterestDistributed(
             msg.sender,
             amount,
             lenderInterest,
-            vaultFee,
-            protocolFee,
+            0, // vaultFee (handled by vault)
+            0, // protocolFee (handled by vault)
             block.timestamp
         );
     }

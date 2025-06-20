@@ -17,7 +17,6 @@ import "./vaultV1uups.sol";
 import "./bubbleFiABI.sol";
 import "./uniswaphelper.sol";
 
-
 contract USDCVault is
     Initializable,
     ReentrancyGuardUpgradeable,
@@ -47,9 +46,9 @@ contract USDCVault is
         uint256 slippageBPS;
         uint256 minBorrowAmount;
         uint256 minLiquidationAmount;
-        uint256 liquidationVaultShare;    // Added for liquidation fee distribution
+        uint256 liquidationVaultShare; // Added for liquidation fee distribution
         uint256 liquidationProtocolShare; // Added for liquidation fee distribution
-        uint256 liquidationLenderShare;   // Added for liquidation fee distribution
+        uint256 liquidationLenderShare; // Added for liquidation fee distribution
     }
 
     struct BorrowerPosition {
@@ -84,6 +83,7 @@ contract USDCVault is
     uint256 public constant DEFAULT_LTV = 7000; // 70% in basis points
     uint256 public constant LIQUIDATION_LTV = 7100; // 71% in basis points
     uint256 public constant DEFAULT_BASE_RATE = 1000;
+    uint256 private constant SECONDS_PER_YEAR = 365 days;
 
     uint256 public constant MIN_DEPOSIT_AMOUNT = 100; // 0.01 USDC
     uint256 public constant MAX_DEPOSIT_AMOUNT = 1000000000; // 1M USDC
@@ -114,7 +114,7 @@ contract USDCVault is
     address public vaultFeeRecipient;
     uint256 public maxBorrow;
     uint256 public accruedVaultFees;
-    uint256 public accruedProtocolFees;
+    uint256 public accruedProtocolFees; // Added separate protocol fee tracking
     uint256 public maxUtilizationOnWithdraw;
     uint256 public vaultHardcodedYield; // Added for yield-based rate calculation
 
@@ -164,6 +164,16 @@ contract USDCVault is
     event VaultHardcodedYieldUpdated(uint256 oldValue, uint256 newValue);
     event MaxBorrowUpdated(uint256 oldValue, uint256 newValue);
     event LendingPoolUpdated(address indexed oldPool, address indexed newPool);
+    event VaultFeesAccrued(
+        uint256 vaultFee,
+        uint256 protocolFee,
+        uint256 timestamp
+    );
+    event LiquidationFeesAccrued(
+        uint256 vaultPenalty,
+        uint256 protocolPenalty,
+        uint256 timestamp
+    );
 
     uint256 public totalLiquidatedUSDC;
 
@@ -206,8 +216,14 @@ contract USDCVault is
         require(_tokenA != address(0), "Invalid token A address");
         require(_tokenB != address(0), "Invalid token B address");
         require(_lpToken != address(0), "Invalid LP token address");
-        require(address(_octoRouter) != address(0), "Invalid octo router address");
-        require(address(_bubbleRouter) != address(0), "Invalid bubble router address");
+        require(
+            address(_octoRouter) != address(0),
+            "Invalid octo router address"
+        );
+        require(
+            address(_bubbleRouter) != address(0),
+            "Invalid bubble router address"
+        );
         require(_lendingPool != address(0), "Invalid lending pool address");
         require(_maxLTV <= _liquidationThreshold, "Invalid LTV configuration");
         require(_kink <= BASIS_POINTS, "Invalid kink value");
@@ -215,7 +231,10 @@ contract USDCVault is
         require(_lenderShare <= BASIS_POINTS, "Invalid lender share");
         require(_slippageBPS <= BASIS_POINTS, "Invalid slippage value");
         require(
-            _liquidationVaultShare + _liquidationProtocolShare + _liquidationLenderShare == BASIS_POINTS,
+            _liquidationVaultShare +
+                _liquidationProtocolShare +
+                _liquidationLenderShare ==
+                BASIS_POINTS,
             "Invalid liquidation fee distribution"
         );
 
@@ -236,8 +255,8 @@ contract USDCVault is
         tokenA = IERC20(_tokenA);
         tokenB = IERC20(_tokenB);
         lpToken = IERC20(_lpToken);
-        octoRouter=IOctoswapRouter02(_octoRouter);
-        bubbleRouter=IBubbleV1Router(payable(_bubbleRouter));
+        octoRouter = IOctoswapRouter02(_octoRouter);
+        bubbleRouter = IBubbleV1Router(payable(_bubbleRouter));
 
         config = VaultConfig({
             maxLTV: _maxLTV,
@@ -321,7 +340,12 @@ contract USDCVault is
     }
 
     // CORE FUNCTIONS - LENDING DELEGATED TO CENTRALIZED POOL
-    function lendUSDC(uint256 amount) external nonReentrant validAmount(amount) notInEmergencyMode {
+    function lendUSDC(uint256 amount)
+        external
+        nonReentrant
+        validAmount(amount)
+        notInEmergencyMode
+    {
         require(amount >= MIN_DEPOSIT_AMOUNT, "Amount too small");
         require(amount <= MAX_DEPOSIT_AMOUNT, "Amount too large");
         require(config.active, "Vault not active");
@@ -331,16 +355,17 @@ contract USDCVault is
         lendingPool.deposit(msg.sender, amount, address(this));
     }
 
-    function withdrawUSDC(uint256 amount) external nonReentrant notInEmergencyMode {
+    function withdrawUSDC(uint256 amount)
+        external
+        nonReentrant
+        notInEmergencyMode
+    {
         // Delegate withdrawal to centralized pool
         lendingPool.withdraw(msg.sender, amount, address(this));
     }
 
     // BORROWING FUNCTIONS - REMAIN VAULT-SPECIFIC
-    function borrow(
-        uint256 collateralAmount,
-        uint256 borrowAmount
-    )
+    function borrow(uint256 collateralAmount, uint256 borrowAmount)
         external
         nonReentrant
         notBorrowingPaused
@@ -349,14 +374,14 @@ contract USDCVault is
     {
         require(config.active, "Vault not active");
         require(config.borrowingEnabled, "Borrowing disabled");
-        
+
         // Check if centralized pool has sufficient liquidity
         require(
             lendingPool.getAvailableLiquidity() >= borrowAmount,
             "Insufficient liquidity in lending pool"
         );
 
-        _accrueInterest();
+        _updateBorrowerInterest(msg.sender);
 
         // Enforce max borrow cap
         uint256 newTotalBorrowed = config.totalBorrowed + borrowAmount;
@@ -433,7 +458,7 @@ contract USDCVault is
         // Borrow from centralized pool
         lendingPool.borrow(address(this), borrowAmount);
         usdc.safeTransfer(msg.sender, borrowAmount);
-        
+
         emit Borrowed(
             msg.sender,
             collateralAmount,
@@ -442,9 +467,7 @@ contract USDCVault is
         );
     }
 
-    function repay(
-        uint256 repayAmount
-    )
+    function repay(uint256 repayAmount)
         external
         nonReentrant
         onlyActiveBorrower(msg.sender)
@@ -453,7 +476,6 @@ contract USDCVault is
     {
         BorrowerPosition storage position = borrowers[msg.sender];
 
-        _accrueInterest();
         _updateBorrowerInterest(msg.sender);
 
         uint256 totalDebt = position.borrowedAmount + position.accruedInterest;
@@ -470,34 +492,27 @@ contract USDCVault is
 
         // FIXED: Proper fee distribution for interest payments
         if (interestPaid > 0) {
-            // Get vault-specific fee rates from lending pool
-            (
-                , // baseRate
-                , // multiplier
-                , // jumpMultiplier
-                , // kink
-                uint256 lenderShare,
-                uint256 vaultFeeRate,
-                uint256 protocolFeeRate
-            ) = lendingPool.getVaultInterestRate(address(this));
-
+            // Use vault's own fee rates from config
             uint256 vaultFee = interestPaid.mulDiv(
-                vaultFeeRate,
+                config.vaultFeeRate,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
             uint256 protocolFee = interestPaid.mulDiv(
-                protocolFeeRate,
+                config.protocolFeeRate,
                 BASIS_POINTS,
                 Math.Rounding.Floor
             );
             uint256 lenderInterest = interestPaid - vaultFee - protocolFee;
 
-            // Update fee accumulations
+            // Vault handles both vault and protocol fees separately
             accruedVaultFees += vaultFee;
             accruedProtocolFees += protocolFee;
 
-            // Send lender interest to centralized pool
+            // Emit fee accrual event
+            emit VaultFeesAccrued(vaultFee, protocolFee, block.timestamp);
+
+            // Send only lender interest to centralized pool
             if (lenderInterest > 0) {
                 lendingPool.distributeInterest(lenderInterest);
             }
@@ -543,9 +558,7 @@ contract USDCVault is
         emit Repaid(msg.sender, repayAmount, interestPaid, block.timestamp);
     }
 
-    function liquidate(
-        address borrower
-    )
+    function liquidate(address borrower)
         external
         nonReentrant
         notLiquidationsPaused
@@ -555,7 +568,6 @@ contract USDCVault is
         require(liquidationEnabled, "Liquidation is disabled");
         require(config.active, "Vault not active");
 
-        _accrueInterest();
         _updateBorrowerInterest(borrower);
 
         require(!_isHealthy(borrower, true), "Position is healthy");
@@ -591,11 +603,18 @@ contract USDCVault is
         );
         uint256 lenderPenalty = penalty - vaultPenalty - protocolPenalty;
 
-        // Update fees
+        // Vault handles both vault and protocol penalties separately
         accruedVaultFees += vaultPenalty;
         accruedProtocolFees += protocolPenalty;
 
-        // Send lender penalty to centralized pool
+        // Emit liquidation fee accrual event
+        emit LiquidationFeesAccrued(
+            vaultPenalty,
+            protocolPenalty,
+            block.timestamp
+        );
+
+        // Send only lender penalty to centralized pool
         if (lenderPenalty > 0) {
             lendingPool.distributeInterest(lenderPenalty);
         }
@@ -637,9 +656,11 @@ contract USDCVault is
     }
 
     // INTEREST CALCULATION FUNCTIONS
-    function _calculateBorrowerInterest(
-        address borrower
-    ) internal view returns (uint256) {
+    function _calculateBorrowerInterest(address borrower)
+        internal
+        view
+        returns (uint256)
+    {
         BorrowerPosition storage position = borrowers[borrower];
         if (!position.isActive || position.borrowedAmount == 0)
             return position.accruedInterest;
@@ -649,7 +670,11 @@ contract USDCVault is
         uint256 currentBorrowRate = getBorrowRate();
 
         uint256 newInterest = position.borrowedAmount.mulDiv(
-            currentBorrowRate.mulDiv(timeElapsed, 365 days, Math.Rounding.Ceil),
+            currentBorrowRate.mulDiv(
+                timeElapsed,
+                SECONDS_PER_YEAR,
+                Math.Rounding.Ceil
+            ),
             BASIS_POINTS,
             Math.Rounding.Ceil
         );
@@ -663,72 +688,6 @@ contract USDCVault is
         position.lastUpdateTime = block.timestamp;
     }
 
-    function _accrueInterest() internal {
-        uint256 timeElapsed = block.timestamp - lastAccrualTime;
-        if (timeElapsed == 0) return;
-
-        uint256 borrowRate = getBorrowRate();
-
-        // FIXED: Process borrower interest and distribute fees properly
-        uint256 totalInterestGenerated = 0;
-
-        for (uint256 i = 0; i < activeBorrowers.length; i++) {
-            address borrower = activeBorrowers[i];
-            BorrowerPosition storage position = borrowers[borrower];
-
-            if (position.isActive && position.borrowedAmount > 0) {
-                uint256 interest = _calculateInterest(
-                    position.borrowedAmount,
-                    borrowRate,
-                    timeElapsed
-                );
-
-                totalInterestGenerated += interest;
-                position.accruedInterest += interest;
-                position.lastUpdateTime = block.timestamp;
-            }
-        }
-
-        // Distribute generated interest
-        if (totalInterestGenerated > 0) {
-            // Get vault-specific fee rates from lending pool
-            (
-                , // baseRate
-                , // multiplier
-                , // jumpMultiplier
-                , // kink
-                uint256 lenderShare,
-                uint256 vaultFeeRate,
-                uint256 protocolFeeRate
-            ) = lendingPool.getVaultInterestRate(address(this));
-
-            uint256 vaultFee = totalInterestGenerated.mulDiv(
-                vaultFeeRate,
-                BASIS_POINTS,
-                Math.Rounding.Floor
-            );
-            uint256 protocolFee = totalInterestGenerated.mulDiv(
-                protocolFeeRate,
-                BASIS_POINTS,
-                Math.Rounding.Floor
-            );
-            uint256 lenderInterest = totalInterestGenerated -
-                vaultFee -
-                protocolFee;
-
-            // Update fee accumulations
-            accruedVaultFees += vaultFee;
-            accruedProtocolFees += protocolFee;
-
-            // Send lender interest to centralized pool
-            if (lenderInterest > 0) {
-                lendingPool.distributeInterest(lenderInterest);
-            }
-        }
-
-        lastAccrualTime = block.timestamp;
-    }
-
     function _calculateInterest(
         uint256 principal,
         uint256 rate,
@@ -736,21 +695,23 @@ contract USDCVault is
     ) internal pure returns (uint256) {
         if (principal == 0 || rate == 0 || timeElapsed == 0) return 0;
 
-        uint256 yearInSeconds = 31557600; // 365.25 * 24 * 60 * 60
+        // uint256 yearInSeconds = 31557600; // 365.25 * 24 * 60 * 60
 
         return
             principal.mulDiv(
                 rate * timeElapsed,
-                BASIS_POINTS * yearInSeconds,
+                BASIS_POINTS * SECONDS_PER_YEAR,
                 Math.Rounding.Ceil
             );
     }
 
     /// Get token price in USDC using oracle
     /// @return price Price in calculation decimals (18 decimals) representing USDC value per token
-    function _getTokenPriceInUSDC(
-        address token
-    ) internal view returns (uint256 price) {
+    function _getTokenPriceInUSDC(address token)
+        internal
+        view
+        returns (uint256 price)
+    {
         if (token == USDC_ADDRESS) {
             return 1e18; // 1 USDC = 1e18 in calculation format
         }
@@ -820,25 +781,31 @@ contract USDCVault is
     }
 
     /// Convert USDC (6 decimals) to calculation format (18 decimals)
-    function _toCalculationDecimals(
-        uint256 usdcAmount
-    ) private pure returns (uint256) {
+    function _toCalculationDecimals(uint256 usdcAmount)
+        private
+        pure
+        returns (uint256)
+    {
         return usdcAmount * USDC_TO_CALC_SCALE;
     }
 
     /// Convert calculation format (18 decimals) to USDC (6 decimals)
-    function _fromCalculationDecimals(
-        uint256 calcAmount
-    ) private pure returns (uint256) {
+    function _fromCalculationDecimals(uint256 calcAmount)
+        private
+        pure
+        returns (uint256)
+    {
         return calcAmount / USDC_TO_CALC_SCALE;
     }
 
     /// Get collateral value in USDC
     /// @param vaultShares Amount of vault shares
     /// @return value Total value in USDC (6 decimals)
-    function _getCollateralValue(
-        uint256 vaultShares
-    ) internal view returns (uint256 value) {
+    function _getCollateralValue(uint256 vaultShares)
+        internal
+        view
+        returns (uint256 value)
+    {
         if (vaultShares == 0) return 0;
 
         // Get LP tokens for vault shares
@@ -866,9 +833,11 @@ contract USDCVault is
     }
 
     /// Calculate token amounts from LP tokens
-    function _calculateTokenAmountsFromLP(
-        uint256 lpTokenAmount
-    ) internal view returns (uint256 tokenAAmount, uint256 tokenBAmount) {
+    function _calculateTokenAmountsFromLP(uint256 lpTokenAmount)
+        internal
+        view
+        returns (uint256 tokenAAmount, uint256 tokenBAmount)
+    {
         if (lpTokenAmount == 0) return (0, 0);
 
         uint256 totalSupply = lpToken.totalSupply();
@@ -890,9 +859,10 @@ contract USDCVault is
     }
 
     /// Convert vault shares to USDC through liquidation
-    function _liquidateCollateral(
-        uint256 vaultShares
-    ) internal returns (uint256 usdcAmount) {
+    function _liquidateCollateral(uint256 vaultShares)
+        internal
+        returns (uint256 usdcAmount)
+    {
         if (vaultShares == 0) return 0;
 
         IERC20(address(bubbleVault)).approve(address(bubbleVault), vaultShares);
@@ -910,10 +880,10 @@ contract USDCVault is
     }
 
     /// Swap token to USDC
-    function _swapToUSDC(
-        address token,
-        uint256 amount
-    ) internal returns (uint256 usdcReceived) {
+    function _swapToUSDC(address token, uint256 amount)
+        internal
+        returns (uint256 usdcReceived)
+    {
         if (amount == 0 || token == address(usdc)) return amount;
 
         IERC20(token).approve(address(octoRouter), amount);
@@ -962,11 +932,12 @@ contract USDCVault is
             uint256 baseRate,
             uint256 multiplier,
             uint256 jumpMultiplier,
-            uint256 kink,
-            , // lenderShare - not needed for borrow rate calculation
-            , // vaultFeeRate - not needed for borrow rate calculation
-            // protocolFeeRate - not needed for borrow rate calculation
-        ) = lendingPool.getVaultInterestRate(address(this));
+            uint256 kink, // lenderShare - not needed for borrow rate calculation // vaultFeeRate - not needed for borrow rate calculation
+            ,
+            ,
+
+        ) = // protocolFeeRate - not needed for borrow rate calculation
+            lendingPool.getVaultInterestRate(address(this));
 
         uint256 yieldGenerated = (vaultHardcodedYield > 0)
             ? vaultHardcodedYield
@@ -1008,14 +979,19 @@ contract USDCVault is
 
         // Get vault-specific lender share from lending pool
         (
-            , // baseRate
-            , // multiplier
-            , // jumpMultiplier
-            , // kink
-            uint256 lenderShare,
-            , // vaultFeeRate
-            // protocolFeeRate
-        ) = lendingPool.getVaultInterestRate(address(this));
+            ,
+            ,
+            ,
+            ,
+            // baseRate
+            // multiplier
+            // jumpMultiplier
+            // kink
+            uint256 lenderShare, // vaultFeeRate
+            ,
+
+        ) = // protocolFeeRate
+            lendingPool.getVaultInterestRate(address(this));
 
         uint256 rateToPool = borrowRate.mulDiv(
             lenderShare,
@@ -1026,10 +1002,11 @@ contract USDCVault is
             utilization.mulDiv(rateToPool, BASIS_POINTS, Math.Rounding.Floor);
     }
 
-    function _isHealthy(
-        address borrower,
-        bool forLiquidation
-    ) internal view returns (bool) {
+    function _isHealthy(address borrower, bool forLiquidation)
+        internal
+        view
+        returns (bool)
+    {
         BorrowerPosition storage position = borrowers[borrower];
         if (!position.isActive || position.collateralAmount == 0) return true;
 
@@ -1100,18 +1077,23 @@ contract USDCVault is
         emit VaultHardcodedYieldUpdated(oldValue, yieldBPS);
     }
 
-    function setProtocolFeeRecipient(address recipient) external onlyOwner {
-        require(recipient != address(0), "Invalid address");
-        protocolFeeRecipient = recipient;
-    }
-
     function setVaultFeeRecipient(address recipient) external onlyOwner {
         require(recipient != address(0), "Invalid address");
         vaultFeeRecipient = recipient;
     }
 
+    function setProtocolFeeRecipient(address recipient) external onlyOwner {
+        require(recipient != address(0), "Invalid address");
+        protocolFeeRecipient = recipient;
+    }
+
     function withdrawFees(uint256 amount, bool isProtocol) external onlyOwner {
         if (isProtocol) {
+            // Withdraw protocol fees from separate tracking
+            require(
+                protocolFeeRecipient != address(0),
+                "Protocol fee recipient not set"
+            );
             require(
                 amount <= accruedProtocolFees,
                 "Insufficient protocol fees"
@@ -1119,6 +1101,11 @@ contract USDCVault is
             accruedProtocolFees -= amount;
             usdc.safeTransfer(protocolFeeRecipient, amount);
         } else {
+            // Withdraw vault fees from separate tracking
+            require(
+                vaultFeeRecipient != address(0),
+                "Vault fee recipient not set"
+            );
             require(amount <= accruedVaultFees, "Insufficient vault fees");
             accruedVaultFees -= amount;
             usdc.safeTransfer(vaultFeeRecipient, amount);
@@ -1143,9 +1130,11 @@ contract USDCVault is
         emit TokensRecovered(token, to, amount);
     }
 
-    function _authorizeUpgrade(
-        address newImplementation
-    ) internal override onlyOwner {}
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyOwner
+    {}
 
     function version() external pure returns (string memory) {
         return "1.0.0";
@@ -1156,15 +1145,28 @@ contract USDCVault is
     /// @notice Get the USDC value of a given amount of vault shares (collateral)
     /// @param collateralAmount Amount of vault shares
     /// @return valueInUSDC Value in USDC (6 decimals)
-    function getCollateralValueInUSDC(uint256 collateralAmount) external view returns (uint256 valueInUSDC) {
+    function getCollateralValueInUSDC(uint256 collateralAmount)
+        external
+        view
+        returns (uint256 valueInUSDC)
+    {
         return _getCollateralValue(collateralAmount);
     }
 
-    function getPawUSDCHolderInfo(address user) external view returns (
-        uint256 pawUSDCBalance,
-        uint256 underlyingUSDC,
-        uint256 exchangeRate
-    ) {
+    /// @notice Get PawUSDC holder info: balance, underlying USDC, exchange rate
+    /// @param user Address of the user
+    /// @return pawUSDCBalance User's PawUSDC token balance
+    /// @return underlyingUSDC Equivalent USDC value of user's PawUSDC
+    /// @return exchangeRate Current exchange rate of PawUSDC to USDC
+    function getPawUSDCHolderInfo(address user)
+        external
+        view
+        returns (
+            uint256 pawUSDCBalance,
+            uint256 underlyingUSDC,
+            uint256 exchangeRate
+        )
+    {
         pawUSDCBalance = pawUSDC.balanceOf(user);
         exchangeRate = pawUSDC.getExchangeRate();
         underlyingUSDC = pawUSDC.pawUSDCToUSDC(pawUSDCBalance);
@@ -1176,12 +1178,20 @@ contract USDCVault is
     }
 
     /// @notice Get total yield generated by this vault (interest sent to pool, in USDC)
-    function getVaultYieldGenerated() external view returns (uint256 yieldUSDC) {
+    function getVaultYieldGenerated()
+        external
+        view
+        returns (uint256 yieldUSDC)
+    {
         return lendingPool.getVaultTotalInterestPaid(address(this));
     }
 
     /// @notice Get total lending interest earned by a user (in USDC)
-    function getLendingInterest(address user) external view returns (uint256 interestUSDC) {
+    function getLendingInterest(address user)
+        external
+        view
+        returns (uint256 interestUSDC)
+    {
         return lendingPool.getLenderInterest(user);
     }
 
@@ -1191,12 +1201,52 @@ contract USDCVault is
     }
 
     /// @notice Get total protocol and vault fees accrued (in USDC)
-    function getRedemptionFees() external view returns (uint256 protocolFees, uint256 vaultFees) {
+    function getRedemptionFees()
+        external
+        view
+        returns (uint256 protocolFees, uint256 vaultFees)
+    {
         return (accruedProtocolFees, accruedVaultFees);
+    }
+
+    /// @notice Get total fees accrued (protocol + vault fees in USDC)
+    function getTotalAccruedFees() external view returns (uint256 totalFees) {
+        return accruedProtocolFees + accruedVaultFees;
     }
 
     /// @notice Get total interest ever distributed to all lenders (in USDC)
     function getTotalInterestDistributed() external view returns (uint256) {
         return lendingPool.getTotalInterestDistributed();
+    }
+
+    /// @notice Get the underlying token amounts for a given amount of vault shares (collateral)
+    /// @param collateralAmount Amount of vault shares
+    /// @return tokenAAmount The amount of tokenA underlying the collateral
+    /// @return tokenBAmount The amount of tokenB underlying the collateral
+    function getUnderlyingTokensForCollateral(uint256 collateralAmount)
+        external
+        view
+        returns (uint256 tokenAAmount, uint256 tokenBAmount)
+    {
+        if (collateralAmount == 0) return (0, 0);
+
+        uint256 lpTokenAmount = bubbleVault.previewRedeem(collateralAmount);
+        if (lpTokenAmount == 0) return (0, 0);
+
+        return _calculateTokenAmountsFromLP(lpTokenAmount);
+    }
+
+    /// @notice Get the total current debt (principal + up-to-date interest) for a borrower
+    /// @param borrower The address of the borrower
+    /// @return totalDebt The total amount (principal + interest) owed by the borrower in 6 decimals
+    function getCurrentDebt(address borrower)
+        external
+        view
+        returns (uint256 totalDebt)
+    {
+        BorrowerPosition storage position = borrowers[borrower];
+        if (!position.isActive) return 0;
+        uint256 upToDateInterest = _calculateBorrowerInterest(borrower);
+        return position.borrowedAmount + upToDateInterest;
     }
 }
