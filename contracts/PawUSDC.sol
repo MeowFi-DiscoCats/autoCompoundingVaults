@@ -87,6 +87,8 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
             exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
         }
     }
+
+    //
     
     // Burn PawUSDC tokens and return USDC based on current exchange rate
     function burn(address from, uint256 pawUSDCAmount) external onlyPool {
