@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.25;
-
+//function
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
@@ -27,6 +27,7 @@ contract USDCVault is
 {
     using SafeERC20 for IERC20;
     using Math for uint256;
+
 
     struct VaultConfig {
         uint256 maxLTV;
@@ -276,6 +277,7 @@ contract USDCVault is
         if (
             borrowerIndex[borrower] == 0 &&
             (activeBorrowers.length == 0 || activeBorrowers[0] != borrower)
+
         ) {
             activeBorrowers.push(borrower);
             borrowerIndex[borrower] = activeBorrowers.length;
@@ -300,7 +302,7 @@ contract USDCVault is
     }
 
     // CORE FUNCTIONS - LENDING DELEGATED TO CENTRALIZED POOL
-    function lendUSDC(uint256 amount) external nonReentrant validAmount(amount) notInEmergencyMode {
+    function lendUSDC(uint256 amount)   external nonReentrant validAmount(amount) notInEmergencyMode {
         require(amount >= MIN_DEPOSIT_AMOUNT, "Amount too small");
         require(amount <= MAX_DEPOSIT_AMOUNT, "Amount too large");
         require(config.active, "Vault not active");
@@ -314,6 +316,7 @@ contract USDCVault is
         // Delegate withdrawal to centralized pool
         lendingPool.withdraw(msg.sender, amount, address(this));
     }
+
 
     // BORROWING FUNCTIONS - REMAIN VAULT-SPECIFIC
     function borrow(
@@ -473,6 +476,8 @@ contract USDCVault is
             
             // Send only lender interest to centralized pool
             if (lenderInterest > 0) {
+                // FIXED: Approve lending pool to spend lender interest
+                usdc.approve(address(lendingPool), lenderInterest);
                 lendingPool.distributeInterest(lenderInterest);
             }
         }
@@ -498,8 +503,11 @@ contract USDCVault is
         // Update pool state
         config.totalBorrowed -= principalPaid;
 
-        // Repay to centralized pool
-        lendingPool.repay(address(this), principalPaid);
+        // FIXED: Repay to centralized pool - approve first, then call repay
+        if (principalPaid > 0) {
+            usdc.approve(address(lendingPool), principalPaid);
+            lendingPool.repay(address(this), principalPaid);
+        }
 
         // Return collateral if fully repaid
         if (collateralToReturn > 0) {
@@ -574,6 +582,8 @@ contract USDCVault is
 
         // Send only lender penalty to centralized pool
         if (lenderPenalty > 0) {
+            // FIXED: Approve lending pool to spend lender penalty
+            usdc.approve(address(lendingPool), lenderPenalty);
             lendingPool.distributeInterest(lenderPenalty);
         }
 
@@ -599,8 +609,11 @@ contract USDCVault is
 
         _removeActiveBorrower(borrower);
 
-        // Repay to centralized pool
-        lendingPool.repay(address(this), principalRepaid);
+        // FIXED: Repay to centralized pool - approve first, then call repay
+        if (principalRepaid > 0) {
+            usdc.approve(address(lendingPool), principalRepaid);
+            lendingPool.repay(address(this), principalRepaid);
+        }
 
         counter = counter + 1;
         emit Liquidated(
@@ -1141,4 +1154,10 @@ contract USDCVault is
         uint256 priceIn18Decimals = _getTokenPriceInUSDC(token);
         return _fromCalculationDecimals(priceIn18Decimals);
     }
+
+    function getCounter() external  view returns (uint256){
+        return counter;
+    }
 }
+
+
