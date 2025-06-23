@@ -14,6 +14,7 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
     uint256 public exchangeRate; // Exchange rate between PawUSDC and USDC (scaled by 1e18)
     uint256 public totalUnderlying; // Total USDC underlying all PawUSDC tokens
     uint256 public lastUpdateTime;
+    bool public hasAccruedInterest; // Track if interest has ever been accrued
     
     uint256 public constant INITIAL_EXCHANGE_RATE = 1e18; // 1:1 initial rate
     uint256 public constant BASIS_POINTS = 10000;
@@ -67,6 +68,7 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
         
         lastUpdateTime = block.timestamp;
+        hasAccruedInterest = true;
         
         emit InterestAccrued(interestAmount, exchangeRate, block.timestamp);
         emit ExchangeRateUpdated(oldExchangeRate, exchangeRate, block.timestamp);
@@ -83,6 +85,8 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         totalUnderlying += usdcAmount;
         
         // Update exchange rate after minting
+        // If there was accumulated interest (exchangeRate > INITIAL_EXCHANGE_RATE),
+        // new depositors will receive fewer PawUSDC tokens, effectively sharing in the accumulated interest
         if (totalSupply() > 0) {
             exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
         }
@@ -104,11 +108,15 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         // Update exchange rate after burning
         if (totalSupply() > 0) {
             exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
-        } else {
-            // If no tokens left, reset to initial rate
-            exchangeRate = INITIAL_EXCHANGE_RATE;
-            totalUnderlying = 0;
         }
+        // DO NOT reset exchange rate when totalSupply becomes 0
+        // This preserves accumulated interest for future depositors
+        // Only reset if no interest has ever been accrued (fresh start)
+        else if (!hasAccruedInterest) {
+            exchangeRate = INITIAL_EXCHANGE_RATE;
+        }
+        // If interest has been accrued but totalSupply = 0, keep the current exchange rate
+        // This ensures accumulated interest is preserved for future depositors
     }
     
     // Get current exchange rate

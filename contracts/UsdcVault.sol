@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.25;
-//function
+
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
@@ -27,7 +27,6 @@ contract USDCVault is
 {
     using SafeERC20 for IERC20;
     using Math for uint256;
-
 
     struct VaultConfig {
         uint256 maxLTV;
@@ -68,6 +67,7 @@ contract USDCVault is
         0x760AfE86e5de5fa0Ee542fc7B7B713e1c5425701;
     address public constant SHMON_ADDRESS =
         0x3a98250F98Dd388C211206983453837C8365BDc1;
+
 
     uint256 public constant BASIS_POINTS = 10000;
     uint256 public constant USDC_DECIMALS = 6;
@@ -277,7 +277,6 @@ contract USDCVault is
         if (
             borrowerIndex[borrower] == 0 &&
             (activeBorrowers.length == 0 || activeBorrowers[0] != borrower)
-
         ) {
             activeBorrowers.push(borrower);
             borrowerIndex[borrower] = activeBorrowers.length;
@@ -302,7 +301,7 @@ contract USDCVault is
     }
 
     // CORE FUNCTIONS - LENDING DELEGATED TO CENTRALIZED POOL
-    function lendUSDC(uint256 amount)   external nonReentrant validAmount(amount) notInEmergencyMode {
+    function lendUSDC(uint256 amount) external nonReentrant validAmount(amount) notInEmergencyMode {
         require(amount >= MIN_DEPOSIT_AMOUNT, "Amount too small");
         require(amount <= MAX_DEPOSIT_AMOUNT, "Amount too large");
         require(config.active, "Vault not active");
@@ -316,7 +315,6 @@ contract USDCVault is
         // Delegate withdrawal to centralized pool
         lendingPool.withdraw(msg.sender, amount, address(this));
     }
-
 
     // BORROWING FUNCTIONS - REMAIN VAULT-SPECIFIC
     function borrow(
@@ -471,6 +469,14 @@ contract USDCVault is
             accruedVaultFees += vaultFee;
             accruedProtocolFees += protocolFee;
             
+            // Send only vault fees back to the pool to benefit all lenders
+            if (vaultFee > 0) {
+                usdc.approve(address(lendingPool), vaultFee);
+                lendingPool.distributeInterest(vaultFee);
+            }
+            
+            // Protocol fees remain accumulated for admin withdrawal
+            
             // Emit fee accrual event
             emit VaultFeesAccrued(vaultFee, protocolFee, block.timestamp);
             
@@ -576,6 +582,14 @@ contract USDCVault is
         // Vault handles both vault and protocol penalties separately
         accruedVaultFees += vaultPenalty;
         accruedProtocolFees += protocolPenalty;
+        
+        // Send only vault penalties back to the pool to benefit all lenders
+        if (vaultPenalty > 0) {
+            usdc.approve(address(lendingPool), vaultPenalty);
+            lendingPool.distributeInterest(vaultPenalty);
+        }
+        
+        // Protocol penalties remain accumulated for admin withdrawal
         
         // Emit liquidation fee accrual event
         emit LiquidationFeesAccrued(vaultPenalty, protocolPenalty, block.timestamp);
@@ -1035,6 +1049,8 @@ contract USDCVault is
     }
 
     function withdrawFees(uint256 amount, bool isProtocol) external onlyOwner {
+        // NOTE: Vault fees are automatically distributed to the lending pool
+        // Protocol fees are accumulated here for admin withdrawal
         if (isProtocol) {
             // Withdraw protocol fees from separate tracking
             require(protocolFeeRecipient != address(0), "Protocol fee recipient not set");
@@ -1117,7 +1133,7 @@ contract USDCVault is
     }
 
     /// @notice Get total protocol and vault fees accrued (in USDC)
-    function getRedemptionFees() external view returns (uint256 protocolFees, uint256 vaultFees) {
+    function getProtocolAndVaultfees() external view returns (uint256 protocolFees, uint256 vaultFees) {
         return (accruedProtocolFees, accruedVaultFees);
     }
 
@@ -1154,10 +1170,4 @@ contract USDCVault is
         uint256 priceIn18Decimals = _getTokenPriceInUSDC(token);
         return _fromCalculationDecimals(priceIn18Decimals);
     }
-
-    function getCounter() external  view returns (uint256){
-        return counter;
-    }
 }
-
-

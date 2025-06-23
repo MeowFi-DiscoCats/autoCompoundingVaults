@@ -9,7 +9,11 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./interfaces/IPawUsdc.sol";
 import "./interfaces/ICentralizedLendingPool.sol";
 
-contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyGuard {
+contract CentralizedLendingPool is
+    ICentralizedLendingPool,
+    Ownable,
+    ReentrancyGuard
+{
     using SafeERC20 for IERC20;
     using Math for uint256;
 
@@ -42,6 +46,7 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
     uint256 public constant BASIS_POINTS = 10000;
     uint256 public constant MIN_DEPOSIT_AMOUNT = 100; // 0.01 USDC
     uint256 public constant MAX_DEPOSIT_AMOUNT = 1000000000; // 1M USDC
+    uint256 public constant REDEMPTION_FEE_BPS = 25; // 0.25% redemption fee
 
     // State variables
     mapping(address => LenderInfo) public lenders;
@@ -62,6 +67,7 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
 
     // Global interest distributed (for analytics)
     uint256 public totalInterestDistributed;
+    uint256 public totalRedemptionFees; // Track total redemption fees collected
 
     // Events
     event LentUSDC(
@@ -81,17 +87,19 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         uint256 amount,
         uint256 timestamp
     );
-    event VaultRepaid(
-        address indexed vault,
-        uint256 amount,
-        uint256 timestamp
-    );
+    event VaultRepaid(address indexed vault, uint256 amount, uint256 timestamp);
     event InterestDistributed(
         address indexed vault,
         uint256 amount,
         uint256 lenderInterest,
         uint256 vaultFee,
         uint256 protocolFee,
+        uint256 timestamp
+    );
+    event RedemptionFeeCollected(
+        address indexed lender,
+        uint256 withdrawalAmount,
+        uint256 redemptionFee,
         uint256 timestamp
     );
     event VaultRegistered(address indexed vault);
@@ -129,7 +137,10 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
     }
 
     modifier onlyRegisteredVault() {
-        require(vaults[msg.sender].isActive, "Only registered vaults can call this");
+        require(
+            vaults[msg.sender].isActive,
+            "Only registered vaults can call this"
+        );
         _;
     }
 
@@ -160,76 +171,96 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         emit LentUSDC(lender, amount, pawUSDCAmount, block.timestamp);
     }
 
-    function withdraw(
-        address lender,
-        uint256 amount,
-        address vault
-    ) external override nonReentrant {
-        require(vaults[vault].isActive, "Vault not registered");
-        
-        LenderInfo storage lenderInfo = lenders[lender];
-        require(lenderInfo.pawUSDCAmount > 0, "No deposit found");
+   function withdraw(
+    address lender,
+    uint256 amount,
+    address vault
+) external override nonReentrant {
+    require(vaults[vault].isActive, "Vault not registered");
 
-        uint256 maxWithdrawable = pawUSDC.pawUSDCToUSDC(lenderInfo.pawUSDCAmount);
-        if (amount == 0) {
-            amount = maxWithdrawable;
-        }
-        require(amount <= maxWithdrawable, "Withdraw amount exceeds balance");
+    LenderInfo storage lenderInfo = lenders[lender];
+    require(lenderInfo.pawUSDCAmount > 0, "No deposit found");
 
-        // Calculate how much PawUSDC to burn.
-        // We burn a proportional amount of their pawUSDC to get the requested USDC amount.
-        uint256 pawUSDCToBurn = lenderInfo.pawUSDCAmount.mulDiv(amount, maxWithdrawable, Math.Rounding.Ceil);
-        
-        // This is a sanity check, the actual amount transferred is `amount`
-        uint256 totalUSDCToWithdraw = amount; 
-        require(
-            usdc.balanceOf(address(this)) >= totalUSDCToWithdraw,
-            "Insufficient liquidity"
+    uint256 maxWithdrawable = pawUSDC.pawUSDCToUSDC(lenderInfo.pawUSDCAmount);
+    if (amount == 0) {
+        amount = maxWithdrawable;
+    }
+    require(amount <= maxWithdrawable, "Withdraw amount exceeds balance");
+
+    // Determine PawUSDC to burn proportional to requested amount
+ uint256 pawUSDCToBurn = lenderInfo.pawUSDCAmount.mulDiv(amount, maxWithdrawable, Math.Rounding.Floor);
+
+
+    //Recalculate actual USDC based on PawUSDC burned
+    uint256 actualUSDCWithdrawn = pawUSDC.pawUSDCToUSDC(pawUSDCToBurn);
+
+    // Redemption fee applied on actual amount
+    uint256 redemptionFee = actualUSDCWithdrawn.mulDiv(
+        REDEMPTION_FEE_BPS,
+        BASIS_POINTS,
+        Math.Rounding.Floor
+    );
+    uint256 netAmountToLender = actualUSDCWithdrawn - redemptionFee;
+
+    require(
+        usdc.balanceOf(address(this)) >= actualUSDCWithdrawn,
+        "Insufficient liquidity"
+    );
+
+    // Utilization check
+    uint256 principalWithdrawn = Math.min(lenderInfo.depositAmount, actualUSDCWithdrawn);
+    uint256 newTotalDeposits = totalDeposits - principalWithdrawn;
+    if (newTotalDeposits > 0 && totalBorrowed > 0) {
+        uint256 utilizationAfter = totalBorrowed.mulDiv(
+            BASIS_POINTS,
+            newTotalDeposits,
+            Math.Rounding.Ceil
         );
-
-        // Withdrawal control: check utilization after withdrawal
-        // Note: `totalDeposits` tracks principal, so we need to calculate principal withdrawn
-        uint256 principalWithdrawn = Math.min(lenderInfo.depositAmount, amount);
-        uint256 newTotalDeposits = totalDeposits - principalWithdrawn;
-        if (newTotalDeposits > 0 && totalBorrowed > 0) {
-            uint256 utilizationAfter = totalBorrowed.mulDiv(
-                BASIS_POINTS,
-                newTotalDeposits,
-                Math.Rounding.Ceil
-            );
-            require(
-                utilizationAfter <= maxUtilizationOnWithdraw,
-                "Utilization too high after withdrawal"
-            );
-        }
-
-        // Update lender state
-        lenderInfo.depositAmount -= principalWithdrawn;
-        lenderInfo.pawUSDCAmount -= pawUSDCToBurn;
-        lenderInfo.lastUpdateTime = block.timestamp;
-
-        // Update pool state
-        totalDeposits -= principalWithdrawn;
-
-        // Remove from active lenders if fully withdrawn
-        if (lenderInfo.pawUSDCAmount == 0) {
-            _removeActiveLender(lender);
-        }
-
-        // Burn PawUSDC tokens and get USDC back
-        pawUSDC.burn(lender, pawUSDCToBurn);
-
-        // Transfer USDC to lender
-        usdc.safeTransfer(lender, totalUSDCToWithdraw);
-
-        uint256 interestEarned = totalUSDCToWithdraw > principalWithdrawn ? totalUSDCToWithdraw - principalWithdrawn : 0;
-        emit WithdrewUSDC(lender, totalUSDCToWithdraw, interestEarned, block.timestamp);
+        require(
+            utilizationAfter <= maxUtilizationOnWithdraw,
+            "Utilization too high after withdrawal"
+        );
     }
 
-    function borrow(
-        address vault,
-        uint256 amount
-    ) external override onlyRegisteredVault nonReentrant validAmount(amount) {
+    //  Update states
+    lenderInfo.depositAmount -= principalWithdrawn;
+    lenderInfo.pawUSDCAmount -= pawUSDCToBurn;
+    lenderInfo.lastUpdateTime = block.timestamp;
+
+    totalDeposits -= principalWithdrawn;
+    totalRedemptionFees += redemptionFee;
+
+    if (lenderInfo.pawUSDCAmount == 0) {
+        _removeActiveLender(lender);
+    }
+
+    // Burn PawUSDC
+    pawUSDC.burn(lender, pawUSDCToBurn);
+
+    // Accrue fee to protocol AFTER burn
+    if (redemptionFee > 0) {
+        pawUSDC.accrueInterest(redemptionFee);
+    }
+
+    // Transfer actual net USDC to lender
+    usdc.safeTransfer(lender, netAmountToLender);
+
+    uint256 interestEarned = netAmountToLender > principalWithdrawn
+        ? netAmountToLender - principalWithdrawn
+        : 0;
+
+    emit WithdrewUSDC(lender, netAmountToLender, interestEarned, block.timestamp);
+    emit RedemptionFeeCollected(lender, actualUSDCWithdrawn, redemptionFee, block.timestamp);
+}
+
+
+    function borrow(address vault, uint256 amount)
+        external
+        override
+        onlyRegisteredVault
+        nonReentrant
+        validAmount(amount)
+    {
         require(
             usdc.balanceOf(address(this)) >= amount,
             "Insufficient liquidity"
@@ -244,12 +275,18 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         emit VaultBorrowed(vault, amount, block.timestamp);
     }
 
-    function repay(
-        address vault,
-        uint256 amount
-    ) external override onlyRegisteredVault nonReentrant validAmount(amount) {
+    function repay(address vault, uint256 amount)
+        external
+        override
+        onlyRegisteredVault
+        nonReentrant
+        validAmount(amount)
+    {
         VaultInfo storage vaultInfo = vaults[vault];
-        require(vaultInfo.borrowedAmount >= amount, "Repay amount exceeds borrowed");
+        require(
+            vaultInfo.borrowedAmount >= amount,
+            "Repay amount exceeds borrowed"
+        );
 
         vaultInfo.borrowedAmount -= amount;
         vaultInfo.lastUpdateTime = block.timestamp;
@@ -259,13 +296,21 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         emit VaultRepaid(vault, amount, block.timestamp);
     }
 
-    function distributeInterest(uint256 amount) external override onlyRegisteredVault nonReentrant {
+    function distributeInterest(uint256 amount)
+        external
+        override
+        onlyRegisteredVault
+        nonReentrant
+    {
         require(amount > 0, "Amount must be greater than 0");
         require(totalDeposits > 0, "No deposits to distribute to");
 
         // Get vault-specific interest rate configuration
         VaultInterestRate storage rateConfig = vaultInterestRates[msg.sender];
-        require(rateConfig.lenderShare > 0, "Vault interest rate not configured");
+        require(
+            rateConfig.lenderShare > 0,
+            "Vault interest rate not configured"
+        );
 
         // Transfer interest from sender
         usdc.safeTransferFrom(msg.sender, address(this), amount);
@@ -391,7 +436,10 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
 
     function unregisterVault(address vault) external onlyOwner {
         require(vaults[vault].isActive, "Vault not registered");
-        require(vaults[vault].borrowedAmount == 0, "Vault has outstanding debt");
+        require(
+            vaults[vault].borrowedAmount == 0,
+            "Vault has outstanding debt"
+        );
 
         vaults[vault].isActive = false;
         delete vaultInterestRates[vault];
@@ -459,15 +507,25 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         return usdc.balanceOf(address(this));
     }
 
-    function getLenderDeposit(address lender) external view override returns (uint256) {
+    function getLenderDeposit(address lender)
+        external
+        view
+        override
+        returns (uint256)
+    {
         return lenders[lender].depositAmount;
     }
 
-    function getLenderInterest(address lender) external view override returns (uint256) {
+    function getLenderInterest(address lender)
+        external
+        view
+        override
+        returns (uint256)
+    {
         // With interest-bearing PawUSDC, interest is calculated via exchange rate
         LenderInfo storage info = lenders[lender];
         if (info.pawUSDCAmount == 0) return 0;
-        
+
         uint256 currentUnderlying = pawUSDC.pawUSDCToUSDC(info.pawUSDCAmount);
         if (currentUnderlying > info.depositAmount) {
             return currentUnderlying - info.depositAmount;
@@ -479,28 +537,38 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         return totalBorrowed;
     }
 
-    function getVaultBorrowed(address vault) external view override returns (uint256) {
+    function getVaultBorrowed(address vault)
+        external
+        view
+        override
+        returns (uint256)
+    {
         return vaults[vault].borrowedAmount;
     }
 
     function getUtilizationRate() external view returns (uint256) {
         if (totalDeposits == 0) return 0;
-        return totalBorrowed.mulDiv(
-            BASIS_POINTS,
-            totalDeposits,
-            Math.Rounding.Floor
-        );
+        return
+            totalBorrowed.mulDiv(
+                BASIS_POINTS,
+                totalDeposits,
+                Math.Rounding.Floor
+            );
     }
 
-    function getVaultInterestRate(address vault) external view returns (
-        uint256 baseRate,
-        uint256 multiplier,
-        uint256 jumpMultiplier,
-        uint256 kink,
-        uint256 lenderShare,
-        uint256 vaultFeeRate,
-        uint256 protocolFeeRate
-    ) {
+    function getVaultInterestRate(address vault)
+        external
+        view
+        returns (
+            uint256 baseRate,
+            uint256 multiplier,
+            uint256 jumpMultiplier,
+            uint256 kink,
+            uint256 lenderShare,
+            uint256 vaultFeeRate,
+            uint256 protocolFeeRate
+        )
+    {
         VaultInterestRate storage rateConfig = vaultInterestRates[vault];
         return (
             rateConfig.baseRate,
@@ -543,7 +611,16 @@ contract CentralizedLendingPool is ICentralizedLendingPool, Ownable, ReentrancyG
         return totalInterestDistributed;
     }
 
-    function getVaultTotalInterestPaid(address vault) external view returns (uint256) {
+    function getVaultTotalInterestPaid(address vault)
+        external
+        view
+        returns (uint256)
+    {
         return vaults[vault].totalInterestPaid;
     }
-} 
+
+    // Get total redemption fees collected over lifetime
+    function getTotalRedemptionFees() external view returns (uint256) {
+        return totalRedemptionFees;
+    }
+}
