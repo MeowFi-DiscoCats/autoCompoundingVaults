@@ -1314,3 +1314,13 @@ contract USDCVault is
     }
 
 }
+
+
+contract UsdcVaultV2 is USDCVault {
+   
+    uint256 public number;
+
+    function setNumber(uint256 amount) external {
+        number = amount;
+    }
+}

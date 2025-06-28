@@ -224,113 +224,12 @@ async function main() {
     // TEST 4: REPAYMENT
     // ============================================================================
     
-    console.log("\n=== TEST 4: REPAYMENT ===");
-    
-    // Check if deployer has an active borrowing position
-    const borrowerPosition = await usdcVault.borrowers(deployer.address);
-    
-    if (borrowerPosition.isActive && borrowerPosition.borrowedAmount > 0) {
-      try {
-        // Get current debt
-        const currentDebt = await usdcVault.getCurrentDebt(deployer.address);
-        console.log("Current total debt:", ethers.formatUnits(currentDebt, 6), "USDC");
-        
-        // Check deployer's USDC balance
-        const deployerUSDCBalance = await usdc.balanceOf(deployer.address);
-        console.log("Deployer USDC balance:", ethers.formatUnits(deployerUSDCBalance, 6));
-        
-        // DEBUG: Check borrower position details
-        console.log("\n=== DEBUG: Borrower Position Details ===");
-        console.log("Borrowed Amount:", ethers.formatUnits(borrowerPosition.borrowedAmount, 6), "USDC");
-        console.log("Accrued Interest:", ethers.formatUnits(borrowerPosition.accruedInterest, 6), "USDC");
-        console.log("Is Active:", borrowerPosition.isActive);
-        console.log("Last Update Time:", borrowerPosition.lastUpdateTime.toString());
-        
-        // DEBUG: Check vault configuration
-        const vaultConfig = await usdcVault.config();
-        console.log("\n=== DEBUG: Vault Configuration ===");
-        console.log("Vault Active:", vaultConfig.active);
-        console.log("Borrowing Enabled:", vaultConfig.borrowingEnabled);
-        console.log("Emergency Mode:", await usdcVault.emergencyMode());
-        console.log("Liquidations Paused:", await usdcVault.liquidationsPaused());
-        
-        // DEBUG: Check lending pool status
-        console.log("\n=== DEBUG: Lending Pool Status ===");
-        const lendingPoolAddress = await usdcVault.lendingPool();
-        console.log("Lending Pool Address:", lendingPoolAddress);
-        const isVaultRegistered = await lendingPool.vaults(DEPLOYED_ADDRESSES.USDCVault);
-        console.log("Is Vault Registered:", isVaultRegistered.isActive);
-        
-        // Repay half of the debt
-        const repayAmount = currentDebt / 2n;
-        console.log("Repaying amount:", ethers.formatUnits(repayAmount, 6), "USDC");
-        
-        if (deployerUSDCBalance >= repayAmount) {
-          // Approve USDC spending for vault
-          console.log("Approving USDC spending for vault...");
-          const approveTx = await usdc.connect(deployer).approve(DEPLOYED_ADDRESSES.USDCVault, repayAmount);
-          await approveTx.wait();
-          console.log("✅ USDC approved for vault");
-          
-          // Check allowance
-          const allowance = await usdc.allowance(deployer.address, DEPLOYED_ADDRESSES.USDCVault);
-          console.log("USDC Allowance:", ethers.formatUnits(allowance, 6));
-          
-          // Repay debt
-          console.log("Repaying debt...");
-          const repayTx = await usdcVault.connect(deployer).repay(repayAmount);
-          await repayTx.wait();
-          console.log("✅ Debt repaid successfully");
-          
-          // Check balances after repayment
-          console.log("\n=== AFTER REPAYMENT ===");
-          await printBalances(usdc, pawUSDC, lendingPool, deployer.address, "Deployer");
-          await printSystemState(pawUSDC, lendingPool);
-          
-          // Get updated borrower position
-          const updatedPosition = await usdcVault.borrowers(deployer.address);
-          console.log("\nUpdated Borrower Position:");
-          console.log("  Collateral Amount:", ethers.formatUnits(updatedPosition.collateralAmount, 18), "LP tokens");
-          console.log("  Borrowed Amount:", ethers.formatUnits(updatedPosition.borrowedAmount, 6), "USDC");
-          console.log("  Accrued Interest:", ethers.formatUnits(updatedPosition.accruedInterest, 6), "USDC");
-          console.log("  Is Active:", updatedPosition.isActive);
-          
-          // Get updated current debt
-          const updatedDebt = await usdcVault.getCurrentDebt(deployer.address);
-          console.log("  Updated Current Debt:", ethers.formatUnits(updatedDebt, 6), "USDC");
-          
-        } else {
-          console.log("❌ Insufficient USDC balance for repayment");
-          console.log("Need:", ethers.formatUnits(repayAmount, 6), "USDC");
-          console.log("Have:", ethers.formatUnits(deployerUSDCBalance, 6), "USDC");
-        }
-      } catch (error) {
-        console.log("❌ Repayment failed:", error.message);
-        console.log("Error details:", error);
-        
-        // Try to get more specific error information
-        if (error.data) {
-          console.log("Error data:", error.data);
-        }
-        if (error.reason) {
-          console.log("Error reason:", error.reason);
-        }
-      }
-    } else {
-      console.log("❌ Deployer has no active borrowing position to repay");
-      console.log("ℹ️  You need to borrow USDC first to test repayment");
-    }
-
-    // ============================================================================
-    // TEST 5: FULL REPAYMENT AND COLLATERAL RETURN
-    // ============================================================================
-    
-    // console.log("\n=== TEST 5: FULL REPAYMENT AND COLLATERAL RETURN ===");
+    // console.log("\n=== TEST 4: REPAYMENT ===");
     
     // // Check if deployer has an active borrowing position
-    // const finalPosition = await usdcVault.borrowers(deployer.address);
+    // const borrowerPosition = await usdcVault.borrowers(deployer.address);
     
-    // if (finalPosition.isActive && finalPosition.borrowedAmount > 0) {
+    // if (borrowerPosition.isActive && borrowerPosition.borrowedAmount > 0) {
     //   try {
     //     // Get current debt
     //     const currentDebt = await usdcVault.getCurrentDebt(deployer.address);
@@ -340,47 +239,148 @@ async function main() {
     //     const deployerUSDCBalance = await usdc.balanceOf(deployer.address);
     //     console.log("Deployer USDC balance:", ethers.formatUnits(deployerUSDCBalance, 6));
         
-    //     if (deployerUSDCBalance >= currentDebt) {
+    //     // DEBUG: Check borrower position details
+    //     console.log("\n=== DEBUG: Borrower Position Details ===");
+    //     console.log("Borrowed Amount:", ethers.formatUnits(borrowerPosition.borrowedAmount, 6), "USDC");
+    //     console.log("Accrued Interest:", ethers.formatUnits(borrowerPosition.accruedInterest, 6), "USDC");
+    //     console.log("Is Active:", borrowerPosition.isActive);
+    //     console.log("Last Update Time:", borrowerPosition.lastUpdateTime.toString());
+        
+    //     // DEBUG: Check vault configuration
+    //     const vaultConfig = await usdcVault.config();
+    //     console.log("\n=== DEBUG: Vault Configuration ===");
+    //     console.log("Vault Active:", vaultConfig.active);
+    //     console.log("Borrowing Enabled:", vaultConfig.borrowingEnabled);
+    //     console.log("Emergency Mode:", await usdcVault.emergencyMode());
+    //     console.log("Liquidations Paused:", await usdcVault.liquidationsPaused());
+        
+    //     // DEBUG: Check lending pool status
+    //     console.log("\n=== DEBUG: Lending Pool Status ===");
+    //     const lendingPoolAddress = await usdcVault.lendingPool();
+    //     console.log("Lending Pool Address:", lendingPoolAddress);
+    //     const isVaultRegistered = await lendingPool.vaults(DEPLOYED_ADDRESSES.USDCVault);
+    //     console.log("Is Vault Registered:", isVaultRegistered.isActive);
+        
+    //     // Repay half of the debt
+    //     const repayAmount = currentDebt / 2n;
+    //     console.log("Repaying amount:", ethers.formatUnits(repayAmount, 6), "USDC");
+        
+    //     if (deployerUSDCBalance >= repayAmount) {
     //       // Approve USDC spending for vault
-    //       console.log("Approving USDC spending for full repayment...");
-    //       const approveTx = await usdc.connect(deployer).approve(DEPLOYED_ADDRESSES.USDCVault, currentDebt);
+    //       console.log("Approving USDC spending for vault...");
+    //       const approveTx = await usdc.connect(deployer).approve(DEPLOYED_ADDRESSES.USDCVault, repayAmount);
     //       await approveTx.wait();
     //       console.log("✅ USDC approved for vault");
           
-    //       // Repay full debt
-    //       console.log("Repaying full debt...");
-    //       const repayTx = await usdcVault.connect(deployer).repay(currentDebt);
-    //       await repayTx.wait();
-    //       console.log("✅ Full debt repaid successfully");
+    //       // Check allowance
+    //       const allowance = await usdc.allowance(deployer.address, DEPLOYED_ADDRESSES.USDCVault);
+    //       console.log("USDC Allowance:", ethers.formatUnits(allowance, 6));
           
-    //       // Check balances after full repayment
-    //       console.log("\n=== AFTER FULL REPAYMENT ===");
+    //       // Repay debt
+    //       console.log("Repaying debt...");
+    //       const repayTx = await usdcVault.connect(deployer).repay(repayAmount);
+    //       await repayTx.wait();
+    //       console.log("✅ Debt repaid successfully");
+          
+    //       // Check balances after repayment
+    //       console.log("\n=== AFTER REPAYMENT ===");
     //       await printBalances(usdc, pawUSDC, lendingPool, deployer.address, "Deployer");
     //       await printSystemState(pawUSDC, lendingPool);
           
-    //       // Check if collateral was returned
-    //       const finalBorrowerPosition = await usdcVault.borrowers(deployer.address);
-    //       console.log("\nFinal Borrower Position:");
-    //       console.log("  Collateral Amount:", ethers.formatUnits(finalBorrowerPosition.collateralAmount, 18), "LP tokens");
-    //       console.log("  Borrowed Amount:", ethers.formatUnits(finalBorrowerPosition.borrowedAmount, 6), "USDC");
-    //       console.log("  Accrued Interest:", ethers.formatUnits(finalBorrowerPosition.accruedInterest, 6), "USDC");
-    //       console.log("  Is Active:", finalBorrowerPosition.isActive);
+    //       // Get updated borrower position
+    //       const updatedPosition = await usdcVault.borrowers(deployer.address);
+    //       console.log("\nUpdated Borrower Position:");
+    //       console.log("  Collateral Amount:", ethers.formatUnits(updatedPosition.collateralAmount, 18), "LP tokens");
+    //       console.log("  Borrowed Amount:", ethers.formatUnits(updatedPosition.borrowedAmount, 6), "USDC");
+    //       console.log("  Accrued Interest:", ethers.formatUnits(updatedPosition.accruedInterest, 6), "USDC");
+    //       console.log("  Is Active:", updatedPosition.isActive);
           
-    //       // Check LP token balance to confirm collateral return
-    //       const finalLPBalance = await bubbleVault.balanceOf(deployer.address);
-    //       console.log("Final LP Token balance:", ethers.formatUnits(finalLPBalance, 18));
+    //       // Get updated current debt
+    //       const updatedDebt = await usdcVault.getCurrentDebt(deployer.address);
+    //       console.log("  Updated Current Debt:", ethers.formatUnits(updatedDebt, 6), "USDC");
           
     //     } else {
-    //       console.log("❌ Insufficient USDC balance for full repayment");
-    //       console.log("Need:", ethers.formatUnits(currentDebt, 6), "USDC");
+    //       console.log("❌ Insufficient USDC balance for repayment");
+    //       console.log("Need:", ethers.formatUnits(repayAmount, 6), "USDC");
     //       console.log("Have:", ethers.formatUnits(deployerUSDCBalance, 6), "USDC");
     //     }
     //   } catch (error) {
-    //     console.log("❌ Full repayment failed:", error.message);
+    //     console.log("❌ Repayment failed:", error.message);
+    //     console.log("Error details:", error);
+        
+    //     // Try to get more specific error information
+    //     if (error.data) {
+    //       console.log("Error data:", error.data);
+    //     }
+    //     if (error.reason) {
+    //       console.log("Error reason:", error.reason);
+    //     }
     //   }
     // } else {
-    //   console.log("ℹ️  No active borrowing position to fully repay");
+    //   console.log("❌ Deployer has no active borrowing position to repay");
+    //   console.log("ℹ️  You need to borrow USDC first to test repayment");
     // }
+
+    // ============================================================================
+    // TEST 5: FULL REPAYMENT AND COLLATERAL RETURN
+    // ============================================================================
+    
+    console.log("\n=== TEST 5: FULL REPAYMENT AND COLLATERAL RETURN ===");
+    
+    // Check if deployer has an active borrowing position
+    const finalPosition = await usdcVault.borrowers(deployer.address);
+    
+    if (finalPosition.isActive && finalPosition.borrowedAmount > 0) {
+      try {
+        // Get current debt
+        const currentDebt = await usdcVault.getCurrentDebt(deployer.address);
+        console.log("Current total debt:", ethers.formatUnits(currentDebt, 6), "USDC");
+        
+        // Check deployer's USDC balance
+        const deployerUSDCBalance = await usdc.balanceOf(deployer.address);
+        console.log("Deployer USDC balance:", ethers.formatUnits(deployerUSDCBalance, 6));
+        
+        if (deployerUSDCBalance >= currentDebt) {
+          // Approve USDC spending for vault
+          console.log("Approving USDC spending for full repayment...");
+          const approveTx = await usdc.connect(deployer).approve(DEPLOYED_ADDRESSES.USDCVault, currentDebt);
+          await approveTx.wait();
+          console.log("✅ USDC approved for vault");
+          
+          // Repay full debt
+          console.log("Repaying full debt...");
+          const repayTx = await usdcVault.connect(deployer).repay(currentDebt);
+          await repayTx.wait();
+          console.log("✅ Full debt repaid successfully");
+          
+          // Check balances after full repayment
+          console.log("\n=== AFTER FULL REPAYMENT ===");
+          await printBalances(usdc, pawUSDC, lendingPool, deployer.address, "Deployer");
+          await printSystemState(pawUSDC, lendingPool);
+          
+          // Check if collateral was returned
+          const finalBorrowerPosition = await usdcVault.borrowers(deployer.address);
+          console.log("\nFinal Borrower Position:");
+          console.log("  Collateral Amount:", ethers.formatUnits(finalBorrowerPosition.collateralAmount, 18), "LP tokens");
+          console.log("  Borrowed Amount:", ethers.formatUnits(finalBorrowerPosition.borrowedAmount, 6), "USDC");
+          console.log("  Accrued Interest:", ethers.formatUnits(finalBorrowerPosition.accruedInterest, 6), "USDC");
+          console.log("  Is Active:", finalBorrowerPosition.isActive);
+          
+          // Check LP token balance to confirm collateral return
+          const finalLPBalance = await bubbleVault.balanceOf(deployer.address);
+          console.log("Final LP Token balance:", ethers.formatUnits(finalLPBalance, 18));
+          
+        } else {
+          console.log("❌ Insufficient USDC balance for full repayment");
+          console.log("Need:", ethers.formatUnits(currentDebt, 6), "USDC");
+          console.log("Have:", ethers.formatUnits(deployerUSDCBalance, 6), "USDC");
+        }
+      } catch (error) {
+        console.log("❌ Full repayment failed:", error.message);
+      }
+    } else {
+      console.log("ℹ️  No active borrowing position to fully repay");
+    }
 
     // // ============================================================================
     // // TEST 6: SYSTEM ANALYTICS

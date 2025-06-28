@@ -87,7 +87,6 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         require(usdcAmount > 0, "Amount must be positive");
         
         // ✅ FIXED: USDC is already transferred to this contract (like cTokens)
-        // No need to transferFrom since USDC is already here
         uint256 pawUSDCAmount = usdcToPawUSDC(usdcAmount);
         require(pawUSDCAmount > 0, "Invalid PawUSDC amount");
         

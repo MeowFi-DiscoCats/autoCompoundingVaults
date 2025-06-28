@@ -28,6 +28,8 @@ contract USDCVaultFactory is Ownable(msg.sender) {
         implementation = _implementation;
     }
 
+    // pool()->implementation->
+
     function createVault(
         string memory name,
         address usdc,

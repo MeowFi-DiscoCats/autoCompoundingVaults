@@ -1,4 +1,6 @@
-const { ethers } = require("hardhat");
+// const { ethers } = require("hardhat");
+const { ethers, upgrades } = require("hardhat");
+require('@openzeppelin/hardhat-upgrades');
 
 async function main() {
   const [deployer] = await ethers.getSigners();
@@ -178,9 +180,55 @@ async function main() {
   }
 }
 
-main()
+async function deployUsdcVaultV2() {
+  const [deployer] = await ethers.getSigners();
+  console.log("Deploying UsdcVaultV2 with the account:", deployer.address);
+  console.log("Account balance:", (await ethers.provider.getBalance(deployer.address)).toString());
+
+  // Get the existing USDC vault proxy address
+  const existingVaultAddress = "0x822b50B9dA2D347569E0a2946dB5eC6bF8C38303";
+  
+  // Get the vault contract with the full interface including upgradeTo
+  const UsdcVault = await ethers.getContractFactory("USDCVault");
+  const usdcVault = UsdcVault.attach(existingVaultAddress);
+  
+  console.log("Existing UsdcVault address:", existingVaultAddress);
+
+  // Deploy the new implementation
+  const UsdcVaultV2 = await ethers.getContractFactory("UsdcVaultV2");
+  // const usdcVaultV2 = await UsdcVaultV2.deploy();
+  // await usdcVaultV2.waitForDeployment();
+  // console.log("UsdcVaultV2 deployed to:", await usdcVaultV2.getAddress());
+
+  // Upgrade the proxy to point to the new implementation
+  
+  const upgraded = await upgrades.upgradeProxy(existingVaultAddress, UsdcVaultV2);
+
+  console.log(upgraded)
+ 
+
+  // Test the new functionality
+  console.log("Testing new V2 functionality...");
+  const setNumberTx = await usdcVault.setNumber(100);
+  await setNumberTx.wait();
+  console.log("Number set to:", 100);
+
+  const number = await usdcVault.number();
+  console.log("Number retrieved:", number.toString());
+  
+  console.log("Upgrade and testing completed successfully!");
+}
+
+// main()
+//   .then(() => process.exit(0))
+//   .catch((error) => {
+//     console.error(error);
+//     process.exit(1);
+//   });
+  
+  deployUsdcVaultV2()
   .then(() => process.exit(0))
   .catch((error) => {
     console.error(error);
     process.exit(1);
-  }); 
+  });
