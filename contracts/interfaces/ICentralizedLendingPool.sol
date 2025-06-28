@@ -51,20 +51,6 @@ interface ICentralizedLendingPool {
     function getAvailableLiquidity() external view returns (uint256);
 
     /**
-     * @dev Get lender's deposit amount
-     * @param lender Address of the lender
-     * @return Deposit amount
-     */
-    function getLenderDeposit(address lender) external view returns (uint256);
-
-    /**
-     * @dev Get lender's accrued interest
-     * @param lender Address of the lender
-     * @return Accrued interest amount
-     */
-    function getLenderInterest(address lender) external view returns (uint256);
-
-    /**
      * @dev Get total borrowed amount
      * @return Total amount borrowed by all vaults
      */
@@ -76,7 +62,6 @@ interface ICentralizedLendingPool {
      * @return Borrowed amount by the vault
      */
     function getVaultBorrowed(address vault) external view returns (uint256);
-
 
     function getVaultInterestRate(address vault) external view returns (
         uint256 baseRate,
@@ -94,9 +79,10 @@ interface ICentralizedLendingPool {
      * @return Total interest paid by this vault
      */
     function getVaultTotalInterestPaid(address vault) external view returns (uint256);
+
     /**
- * @dev Get the total interest ever distributed to all lenders (in USDC)
- * @return Total interest distributed
- */
-function getTotalInterestDistributed() external view returns (uint256);
+     * @dev Get the total interest ever distributed to all lenders (in USDC)
+     * @return Total interest distributed
+     */
+    function getTotalInterestDistributed() external view returns (uint256);
 } 

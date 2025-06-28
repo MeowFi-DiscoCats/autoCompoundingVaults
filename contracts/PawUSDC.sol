@@ -4,27 +4,34 @@ pragma solidity ^0.8.25;
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
     using Math for uint256;
     
     address public borrowingPool;
+    address public usdc; // Add USDC token address
+    uint256 public protocolUSDCBalance; // Track protocol-controlled USDC
     
     // Interest-bearing mechanism
     uint256 public exchangeRate; // Exchange rate between PawUSDC and USDC (scaled by 1e18)
     uint256 public totalUnderlying; // Total USDC underlying all PawUSDC tokens
     uint256 public lastUpdateTime;
     bool public hasAccruedInterest; // Track if interest has ever been accrued
+    uint256 public totalRedemptionFees; // Track total redemption fees collected
     
     uint256 public constant INITIAL_EXCHANGE_RATE = 1e18; // 1:1 initial rate
     uint256 public constant BASIS_POINTS = 10000;
     
     event ExchangeRateUpdated(uint256 oldRate, uint256 newRate, uint256 timestamp);
     event InterestAccrued(uint256 amount, uint256 newExchangeRate, uint256 timestamp);
+    event RedemptionFeeCollected(uint256 amount, uint256 newExchangeRate, uint256 timestamp);
     
-    function initialize() public initializer {
+    function initialize(address _usdc) public initializer {
         __ERC20_init("pawUSDC", "pawUSDC");
         __Ownable_init(msg.sender);
+        require(_usdc != address(0), "Invalid USDC address");
+        usdc = _usdc;
         exchangeRate = INITIAL_EXCHANGE_RATE;
         lastUpdateTime = block.timestamp;
     }
@@ -62,6 +69,7 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         
         // Update total underlying
         totalUnderlying += interestAmount;
+        protocolUSDCBalance += interestAmount;
         
         // Calculate new exchange rate
         // New rate = (Total underlying) / (Total PawUSDC supply)
@@ -78,15 +86,16 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
     function mint(address to, uint256 usdcAmount) external onlyPool {
         require(usdcAmount > 0, "Amount must be positive");
         
+        // ✅ FIXED: USDC is already transferred to this contract (like cTokens)
+        // No need to transferFrom since USDC is already here
         uint256 pawUSDCAmount = usdcToPawUSDC(usdcAmount);
         require(pawUSDCAmount > 0, "Invalid PawUSDC amount");
         
         _mint(to, pawUSDCAmount);
         totalUnderlying += usdcAmount;
+        protocolUSDCBalance += usdcAmount;
         
         // Update exchange rate after minting
-        // If there was accumulated interest (exchangeRate > INITIAL_EXCHANGE_RATE),
-        // new depositors will receive fewer PawUSDC tokens, effectively sharing in the accumulated interest
         if (totalSupply() > 0) {
             exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
         }
@@ -104,6 +113,8 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         
         _burn(from, pawUSDCAmount);
         totalUnderlying -= usdcAmount;
+        protocolUSDCBalance -= usdcAmount;
+        IERC20(usdc).transfer(from, usdcAmount);
         
         // Update exchange rate after burning
         if (totalSupply() > 0) {
@@ -117,6 +128,50 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         }
         // If interest has been accrued but totalSupply = 0, keep the current exchange rate
         // This ensures accumulated interest is preserved for future depositors
+    }
+
+    // Burn PawUSDC tokens with redemption fee
+    function burnWithFee(address from, uint256 pawUSDCAmount, uint256 feeBps) external onlyPool {
+        require(pawUSDCAmount > 0, "Amount must be positive");
+        require(balanceOf(from) >= pawUSDCAmount, "Insufficient balance");
+        
+        uint256 usdcAmount = pawUSDCToUSDC(pawUSDCAmount);
+        require(usdcAmount > 0, "Invalid USDC amount");
+        
+        // Calculate redemption fee
+        uint256 redemptionFee = usdcAmount.mulDiv(feeBps, 10000, Math.Rounding.Floor);
+        uint256 netAmountToUser = usdcAmount - redemptionFee;
+        
+        _burn(from, pawUSDCAmount);
+        
+        // Only subtract the net amount from totalUnderlying and protocolUSDCBalance
+        // The redemption fee remains in the contract for remaining PawUSDC holders
+        totalUnderlying -= netAmountToUser;
+        protocolUSDCBalance -= netAmountToUser;
+        
+        // Track redemption fees as accrued value
+        totalRedemptionFees += redemptionFee;
+        
+        // Transfer net amount to user
+        IERC20(usdc).transfer(from, netAmountToUser);
+        
+        // Redemption fee stays in PawUSDC contract
+        // This benefits remaining PawUSDC holders by increasing their exchange rate
+        
+        // Update exchange rate after burning
+        if (totalSupply() > 0) {
+            exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
+        }
+        // DO NOT reset exchange rate when totalSupply becomes 0
+        // This preserves accumulated interest and redemption fees for future depositors
+        // Only reset if no interest or redemption fees have ever been accrued (fresh start)
+        else if (!hasAccruedInterest && totalRedemptionFees == 0) {
+            exchangeRate = INITIAL_EXCHANGE_RATE;
+        }
+        // If interest or redemption fees have been accrued but totalSupply = 0, keep the current exchange rate
+        // This ensures accumulated value is preserved for future depositors
+        
+        emit RedemptionFeeCollected(redemptionFee, exchangeRate, block.timestamp);
     }
     
     // Get current exchange rate
@@ -132,6 +187,28 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
     // Get user's underlying USDC balance
     function getUnderlyingBalance(address user) external view returns (uint256) {
         return pawUSDCToUSDC(balanceOf(user));
+    }
+
+    // Get total redemption fees collected
+    function getTotalRedemptionFees() external view returns (uint256) {
+        return totalRedemptionFees;
+    }
+
+    // Admin function to sweep excess USDC (not tracked by protocolUSDCBalance)
+    function sweepStuckUSDC(address to) external onlyOwner {
+        uint256 actualBalance = IERC20(usdc).balanceOf(address(this));
+        require(actualBalance > protocolUSDCBalance, "No excess USDC");
+        uint256 excess = actualBalance - protocolUSDCBalance;
+        IERC20(usdc).transfer(to, excess);
+    }
+    
+    // Transfer USDC to vault (called by borrowing pool)
+    function transferUSDCToVault(address vault, uint256 amount) external onlyPool {
+        require(amount > 0, "Amount must be positive");
+        require(amount <= protocolUSDCBalance, "Insufficient USDC balance");
+        
+        protocolUSDCBalance -= amount;
+        IERC20(usdc).transfer(vault, amount);
     }
 }
 // usdc=0xf817257fed379853cDe0fa4F97AB987181B1E5Ea
@@ -150,9 +227,9 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
 //    multiplier: 2000
 //    jumpMultiplier: 5000
 //    kink: 8000
-//    protocolFeeRate: 100
-//    vaultFeeRate: 200
-//    lenderShare: 8000
+//    protocolFeeRate: 2000
+//    vaultFeeRate: 1000
+//    lenderShare: 7000
 //    slippageBPS: 100
 //    lpToken: "YOUR_LP_TOKEN_ADDRESS"
 //    octoRouter: "YOUR_OCTO_ROUTER_ADDRESS"

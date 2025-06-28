@@ -3,7 +3,7 @@ pragma solidity ^0.8.25;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "./vaultV1.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract AggregatorV1 is ReentrancyGuard {
     address public native=address(0);

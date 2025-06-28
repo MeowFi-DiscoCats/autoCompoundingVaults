@@ -108,8 +108,7 @@ contract USDCVault is
     address public protocolFeeRecipient;
     address public vaultFeeRecipient;
     uint256 public maxBorrow;
-    uint256 public accruedVaultFees;
-    uint256 public accruedProtocolFees; // Added separate protocol fee tracking
+    uint256 public accruedProtocolFees; // Only protocol fees are tracked for admin withdrawal
     uint256 public maxUtilizationOnWithdraw;
     uint256 public vaultHardcodedYield; // Added for yield-based rate calculation
 
@@ -306,8 +305,8 @@ contract USDCVault is
         require(amount <= MAX_DEPOSIT_AMOUNT, "Amount too large");
         require(config.active, "Vault not active");
 
-        // Delegate lending to centralized pool
-        usdc.safeTransferFrom(msg.sender, address(lendingPool), amount);
+        // ✅ FIXED: Delegate lending to centralized pool WITHOUT transferring USDC first
+        // The lending pool will handle the USDC transfer directly from the user
         lendingPool.deposit(msg.sender, amount, address(this));
     }
 
@@ -327,15 +326,20 @@ contract USDCVault is
         validAmount(borrowAmount)
         notInEmergencyMode
     {
-        require(config.active, "Vault not active");
-        require(config.borrowingEnabled, "Borrowing disabled");
+        // ✅ IMPROVED: Use helper function for configuration checks
+        _checkVaultConfiguration();
+        
+        // ✅ ADDED: Check if user has sufficient vault shares for collateral
+        if (collateralAmount > 0) {
+            uint256 userVaultShares = IERC20(address(bubbleVault)).balanceOf(msg.sender);
+            require(userVaultShares >= collateralAmount, "Insufficient vault shares for collateral");
+        }
         
         // Check if centralized pool has sufficient liquidity
-        require(
-            lendingPool.getAvailableLiquidity() >= borrowAmount,
-            "Insufficient liquidity in lending pool"
-        );
+        uint256 availableLiquidity = lendingPool.getAvailableLiquidity();
+        require(availableLiquidity >= borrowAmount, "Insufficient liquidity in lending pool");
 
+        // ✅ FIXED: Only update interest once at the beginning
         _updateBorrowerInterest(msg.sender);
 
         // Enforce max borrow cap
@@ -348,11 +352,9 @@ contract USDCVault is
         BorrowerPosition storage position = borrowers[msg.sender];
 
         if (collateralAmount > 0) {
-            require(
-                IERC20(address(bubbleVault)).balanceOf(msg.sender) >=
-                    collateralAmount,
-                "Insufficient vault shares balance"
-            );
+            // ✅ ADDED: Check allowance before transfer
+            uint256 allowance = IERC20(address(bubbleVault)).allowance(msg.sender, address(this));
+            require(allowance >= collateralAmount, "Insufficient allowance for vault shares");
 
             IERC20(address(bubbleVault)).safeTransferFrom(
                 msg.sender,
@@ -365,8 +367,8 @@ contract USDCVault is
         uint256 totalCollateralAmount = collateralAmount;
 
         if (position.isActive) {
-            _updateBorrowerInterest(msg.sender);
-
+            // ✅ FIXED: Remove redundant interest update - already done above
+            
             // Add existing debt and collateral
             uint256 existingDebt = position.borrowedAmount +
                 position.accruedInterest;
@@ -376,18 +378,37 @@ contract USDCVault is
             require(collateralAmount > 0, "New position requires collateral");
         }
 
-        // Calculate total collateral value with all collateral
+        // ✅ FIXED: Calculate total collateral value with all collateral
         uint256 totalCollateralValueUSDC = _getCollateralValue(
             totalCollateralAmount
         );
         require(totalCollateralValueUSDC > 0, "Invalid collateral value");
 
-        uint256 maxBorrowAmount = totalCollateralValueUSDC.mulDiv(
+        // ✅ FIXED: Use slippage protection for LTV calculation
+        uint256 minCollateralValueUSDC = totalCollateralValueUSDC.mulDiv(
+            BASIS_POINTS - config.slippageBPS,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+
+        // ✅ FIXED: Calculate max borrow based on total debt (existing + new)
+        uint256 maxBorrowAmount = minCollateralValueUSDC.mulDiv(
             config.maxLTV,
             BASIS_POINTS,
             Math.Rounding.Floor
         );
-        require(totalBorrowAmount <= maxBorrowAmount, "Exceeds maximum LTV");
+        
+        // ✅ FIXED: Calculate available borrowing capacity correctly
+        uint256 existingDebt = totalBorrowAmount - borrowAmount; // Remove new borrow to get existing debt
+        uint256 availableBorrowCapacity = existingDebt < maxBorrowAmount 
+            ? maxBorrowAmount - existingDebt 
+            : 0;
+        
+        // ✅ FIXED: Check if new borrow amount exceeds available borrowing capacity
+        require(borrowAmount <= availableBorrowCapacity, "Exceeds maximum LTV");
+
+        // ✅ ADDED: Additional safety check for minimum borrow amount
+        require(borrowAmount >= config.minBorrowAmount, "Borrow amount below minimum");
 
         // Update position
         if (position.isActive) {
@@ -410,8 +431,11 @@ contract USDCVault is
         config.totalCollateral += collateralAmount;
         config.totalBorrowed += borrowAmount;
 
-        // Borrow from centralized pool
+        // ✅ FIXED: Call lending pool borrow and then transfer USDC to borrower
+        // The lending pool transfers USDC to this vault contract, then we transfer to borrower
         lendingPool.borrow(address(this), borrowAmount);
+        
+        // Transfer USDC from vault to borrower
         usdc.safeTransfer(msg.sender, borrowAmount);
         
         emit Borrowed(
@@ -465,25 +489,21 @@ contract USDCVault is
             );
             uint256 lenderInterest = interestPaid - vaultFee - protocolFee;
 
-            // Vault handles both vault and protocol fees separately
-            accruedVaultFees += vaultFee;
-            accruedProtocolFees += protocolFee;
-            
-            // Send only vault fees back to the pool to benefit all lenders
+            // ✅ FIXED: Transfer USDC to lending pool first, then call distributeInterest
             if (vaultFee > 0) {
-                usdc.approve(address(lendingPool), vaultFee);
+                usdc.safeTransfer(address(lendingPool), vaultFee);
                 lendingPool.distributeInterest(vaultFee);
             }
             
             // Protocol fees remain accumulated for admin withdrawal
+            accruedProtocolFees += protocolFee;
             
             // Emit fee accrual event
             emit VaultFeesAccrued(vaultFee, protocolFee, block.timestamp);
             
             // Send only lender interest to centralized pool
             if (lenderInterest > 0) {
-                // FIXED: Approve lending pool to spend lender interest
-                usdc.approve(address(lendingPool), lenderInterest);
+                usdc.safeTransfer(address(lendingPool), lenderInterest);
                 lendingPool.distributeInterest(lenderInterest);
             }
         }
@@ -509,9 +529,12 @@ contract USDCVault is
         // Update pool state
         config.totalBorrowed -= principalPaid;
 
-        // FIXED: Repay to centralized pool - approve first, then call repay
+        // ✅ FIXED: Transfer USDC directly to PawUSDC contract
         if (principalPaid > 0) {
-            usdc.approve(address(lendingPool), principalPaid);
+            // Transfer USDC directly to PawUSDC contract
+            usdc.safeTransfer(address(pawUSDC), principalPaid);
+            
+            // Call lending pool repay to update accounting (without USDC transfer)
             lendingPool.repay(address(this), principalPaid);
         }
 
@@ -556,6 +579,15 @@ contract USDCVault is
         uint256 usdcRecovered = _liquidateCollateral(collateralToLiquidate);
         require(usdcRecovered > 0, "Liquidation failed");
 
+        // ✅ ADD: Slippage protection to prevent front-running
+        uint256 expectedCollateralValue = _getCollateralValue(collateralToLiquidate);
+        uint256 minExpectedUSDC = expectedCollateralValue.mulDiv(
+            BASIS_POINTS - config.slippageBPS,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        require(usdcRecovered >= minExpectedUSDC, "Liquidation slippage too high");
+
         // Track vault-specific total liquidated amount
         totalLiquidatedUSDC += usdcRecovered;
 
@@ -579,25 +611,21 @@ contract USDCVault is
         );
         uint256 lenderPenalty = penalty - vaultPenalty - protocolPenalty;
 
-        // Vault handles both vault and protocol penalties separately
-        accruedVaultFees += vaultPenalty;
-        accruedProtocolFees += protocolPenalty;
-        
-        // Send only vault penalties back to the pool to benefit all lenders
+        // Send vault penalty to pool immediately
         if (vaultPenalty > 0) {
-            usdc.approve(address(lendingPool), vaultPenalty);
+            usdc.safeTransfer(address(lendingPool), vaultPenalty);
             lendingPool.distributeInterest(vaultPenalty);
         }
         
         // Protocol penalties remain accumulated for admin withdrawal
+        accruedProtocolFees += protocolPenalty;
         
         // Emit liquidation fee accrual event
         emit LiquidationFeesAccrued(vaultPenalty, protocolPenalty, block.timestamp);
 
         // Send only lender penalty to centralized pool
         if (lenderPenalty > 0) {
-            // FIXED: Approve lending pool to spend lender penalty
-            usdc.approve(address(lendingPool), lenderPenalty);
+            usdc.safeTransfer(address(lendingPool), lenderPenalty);
             lendingPool.distributeInterest(lenderPenalty);
         }
 
@@ -623,9 +651,9 @@ contract USDCVault is
 
         _removeActiveBorrower(borrower);
 
-        // FIXED: Repay to centralized pool - approve first, then call repay
+        // FIXED: Repay to centralized pool - transfer first, then call repay
         if (principalRepaid > 0) {
-            usdc.approve(address(lendingPool), principalRepaid);
+            usdc.safeTransfer(address(lendingPool), principalRepaid);
             lendingPool.repay(address(this), principalRepaid);
         }
 
@@ -652,10 +680,17 @@ contract USDCVault is
         if (timeElapsed == 0) return position.accruedInterest;
         uint256 currentBorrowRate = getBorrowRate();
 
+        // ✅ FIXED: Use Floor for time component, Ceiling only for final interest
+        uint256 timeComponent = currentBorrowRate.mulDiv(
+            timeElapsed, 
+            SECONDS_PER_YEAR, 
+            Math.Rounding.Floor  // Round DOWN for time calculation
+        );
+        
         uint256 newInterest = position.borrowedAmount.mulDiv(
-            currentBorrowRate.mulDiv(timeElapsed, SECONDS_PER_YEAR, Math.Rounding.Ceil),
+            timeComponent,
             BASIS_POINTS,
-            Math.Rounding.Ceil
+            Math.Rounding.Ceil  // Round UP only for final interest
         );
 
         return position.accruedInterest + newInterest;
@@ -676,12 +711,18 @@ contract USDCVault is
 
         uint256 yearInSeconds = 31557600; // 365.25 * 24 * 60 * 60
 
-        return
-            principal.mulDiv(
-                rate * timeElapsed,
-                BASIS_POINTS * SECONDS_PER_YEAR,
-                Math.Rounding.Ceil
-            );
+   
+        uint256 timeComponent = rate.mulDiv(
+            timeElapsed,
+            yearInSeconds,
+            Math.Rounding.Floor  
+        );
+        
+        return principal.mulDiv(
+            timeComponent,
+            BASIS_POINTS,
+            Math.Rounding.Ceil  // Round UP only for final interest
+        );
     }
 
     /// Get token price in USDC using oracle
@@ -1048,22 +1089,11 @@ contract USDCVault is
         protocolFeeRecipient = recipient;
     }
 
-    function withdrawFees(uint256 amount, bool isProtocol) external onlyOwner {
-        // NOTE: Vault fees are automatically distributed to the lending pool
-        // Protocol fees are accumulated here for admin withdrawal
-        if (isProtocol) {
-            // Withdraw protocol fees from separate tracking
-            require(protocolFeeRecipient != address(0), "Protocol fee recipient not set");
-            require(amount <= accruedProtocolFees, "Insufficient protocol fees");
-            accruedProtocolFees -= amount;
-            usdc.safeTransfer(protocolFeeRecipient, amount);
-        } else {
-            // Withdraw vault fees from separate tracking
-            require(vaultFeeRecipient != address(0), "Vault fee recipient not set");
-            require(amount <= accruedVaultFees, "Insufficient vault fees");
-            accruedVaultFees -= amount;
-            usdc.safeTransfer(vaultFeeRecipient, amount);
-        }
+    function withdrawFees(uint256 amount) external onlyOwner {
+        require(protocolFeeRecipient != address(0), "Protocol fee recipient not set");
+        require(amount <= accruedProtocolFees, "Insufficient protocol fees");
+        accruedProtocolFees -= amount;
+        usdc.safeTransfer(protocolFeeRecipient, amount);
     }
 
     function recoverTokens(
@@ -1121,12 +1151,7 @@ contract USDCVault is
     function getVaultYieldGenerated() external view returns (uint256 yieldUSDC) {
         return lendingPool.getVaultTotalInterestPaid(address(this));
     }
-
-    /// @notice Get total lending interest earned by a user (in USDC)
-    function getLendingInterest(address user) external view returns (uint256 interestUSDC) {
-        return lendingPool.getLenderInterest(user);
-    }
-
+    
     /// @notice Get total amount liquidated in this vault (in USDC)
     function getTotalLiquidatedAmount() external view returns (uint256) {
         return totalLiquidatedUSDC;
@@ -1134,12 +1159,12 @@ contract USDCVault is
 
     /// @notice Get total protocol and vault fees accrued (in USDC)
     function getProtocolAndVaultfees() external view returns (uint256 protocolFees, uint256 vaultFees) {
-        return (accruedProtocolFees, accruedVaultFees);
+        return (accruedProtocolFees, 0);
     }
 
     /// @notice Get total fees accrued (protocol + vault fees in USDC)
     function getTotalAccruedFees() external view returns (uint256 totalFees) {
-        return accruedProtocolFees + accruedVaultFees;
+        return accruedProtocolFees;
     }
 
     /// @notice Get total interest ever distributed to all lenders (in USDC)
@@ -1170,4 +1195,122 @@ contract USDCVault is
         uint256 priceIn18Decimals = _getTokenPriceInUSDC(token);
         return _fromCalculationDecimals(priceIn18Decimals);
     }
+
+    /// @notice Calculate maximum borrow amount for given collateral with slippage protection
+    /// @param collateralAmount Amount of vault shares to use as collateral
+    /// @return maxBorrowAmount Maximum USDC that can be borrowed (with slippage protection)
+    /// @return collateralValueUSDC Current collateral value in USDC
+    /// @return minCollateralValueUSDC Minimum collateral value after slippage protection
+    function getMaxBorrowAmountWithSlippage(uint256 collateralAmount) external view returns (
+        uint256 maxBorrowAmount,
+        uint256 collateralValueUSDC,
+        uint256 minCollateralValueUSDC
+    ) {
+        if (collateralAmount == 0) return (0, 0, 0);
+        
+        // Get current collateral value
+        collateralValueUSDC = _getCollateralValue(collateralAmount);
+        if (collateralValueUSDC == 0) return (0, 0, 0);
+        
+        // Apply slippage protection
+        minCollateralValueUSDC = collateralValueUSDC.mulDiv(
+            BASIS_POINTS - config.slippageBPS,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        
+        // Calculate max borrow amount using slippage-protected value
+        maxBorrowAmount = minCollateralValueUSDC.mulDiv(
+            config.maxLTV,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        
+        return (maxBorrowAmount, collateralValueUSDC, minCollateralValueUSDC);
+    }
+
+    // ✅ ADDED: Helper function to check vault configuration
+    function _checkVaultConfiguration() internal view {
+        require(config.active, "Vault not active");
+        require(config.borrowingEnabled, "Borrowing disabled");
+        require(address(lendingPool) != address(0), "Lending pool not set");
+        require(address(bubbleVault) != address(0), "Bubble vault not set");
+        require(address(priceFetcher) != address(0), "Price fetcher not set");
+        require(config.maxLTV > 0, "Max LTV not configured");
+        require(config.minBorrowAmount > 0, "Min borrow amount not configured");
+    }
+
+    // ✅ ADDED: Helper function to get detailed borrow capacity info
+    function getBorrowCapacityInfo(address borrower) external view returns (
+        uint256 collateralValue,
+        uint256 maxBorrowAmount,
+        uint256 currentDebt,
+        uint256 availableBorrowCapacity,
+        bool isHealthy
+    ) {
+        BorrowerPosition storage position = borrowers[borrower];
+        
+        if (!position.isActive) {
+            return (0, 0, 0, 0, true);
+        }
+        
+        collateralValue = _getCollateralValue(position.collateralAmount);
+        maxBorrowAmount = collateralValue.mulDiv(
+            config.maxLTV,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        currentDebt = position.borrowedAmount + _calculateBorrowerInterest(borrower);
+        availableBorrowCapacity = currentDebt < maxBorrowAmount 
+            ? maxBorrowAmount - currentDebt 
+            : 0;
+        isHealthy = _isHealthy(borrower, false);
+        
+        return (collateralValue, maxBorrowAmount, currentDebt, availableBorrowCapacity, isHealthy);
+    }
+
+    // ✅ ADDED: Helper function to calculate available borrowing capacity for a given collateral amount
+    function getAvailableBorrowCapacityForCollateral(
+        address borrower,
+        uint256 additionalCollateralAmount
+    ) external view returns (
+        uint256 totalCollateralValue,
+        uint256 maxBorrowAmount,
+        uint256 currentDebt,
+        uint256 availableBorrowCapacity
+    ) {
+        BorrowerPosition storage position = borrowers[borrower];
+        
+        // Calculate total collateral (existing + additional)
+        uint256 totalCollateralAmount = additionalCollateralAmount;
+        uint256 currentDebtCalc = 0;
+        
+        if (position.isActive) {
+            totalCollateralAmount += position.collateralAmount;
+            currentDebtCalc = position.borrowedAmount + _calculateBorrowerInterest(borrower);
+        }
+        
+        // Calculate collateral value with slippage protection
+        totalCollateralValue = _getCollateralValue(totalCollateralAmount);
+        uint256 minCollateralValueUSDC = totalCollateralValue.mulDiv(
+            BASIS_POINTS - config.slippageBPS,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        
+        // Calculate max borrow amount
+        maxBorrowAmount = minCollateralValueUSDC.mulDiv(
+            config.maxLTV,
+            BASIS_POINTS,
+            Math.Rounding.Floor
+        );
+        
+        currentDebt = currentDebtCalc;
+        availableBorrowCapacity = currentDebt < maxBorrowAmount 
+            ? maxBorrowAmount - currentDebt 
+            : 0;
+        
+        return (totalCollateralValue, maxBorrowAmount, currentDebt, availableBorrowCapacity);
+    }
+
 }

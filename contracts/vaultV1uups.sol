@@ -4,7 +4,7 @@ pragma solidity ^0.8.25;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./bubbleFiABI.sol";
 import "./uniswaphelper.sol";
@@ -12,6 +12,8 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgrad
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title BubbleLPVault
 /// @notice ERC4626 vault for Bubble LP tokens, with profit-only redemption fee and configurable slippage
@@ -26,7 +28,7 @@ contract BubbleLPVault is Initializable,
     ERC20 public tokenA;
     ERC20 public tokenB;
     IBubbleV1Router public bubbleRouter;
-    ERC20 public lpToken;
+    IERC20 public lpToken;
 
     // Fee on profit, in basis points (e.g. 100 = 1%)
     uint16 public feeBps;
@@ -58,7 +60,7 @@ function initialize(
         ERC20 _tokenA,
         ERC20 _tokenB,
         IBubbleV1Router _bubbleRouter,
-        ERC20 _lpToken,
+        IERC20 _lpToken,
         uint16 _feeBps,
         address _feeRecipient,
         uint16 _depositFeeBps,

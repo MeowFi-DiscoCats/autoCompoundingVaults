@@ -4,7 +4,7 @@ pragma solidity ^0.8.25;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./bubbleFiABI.sol";
 import "./uniswaphelper.sol";
@@ -50,7 +50,6 @@ contract BubbleLPVault is ERC4626, Ownable, ReentrancyGuard {
         address indexed newRecipient
     );
     event rawDeposit(address indexed user, uint256 grossLp, uint256 netLp);
-
     constructor(
         ERC20 _tokenA,
         ERC20 _tokenB,
