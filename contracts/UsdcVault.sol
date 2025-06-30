@@ -163,10 +163,6 @@ contract USDCVault is
 
     uint256 public totalLiquidatedUSDC;
 
-    constructor() {
-        _disableInitializers();
-    }
-
     function initialize(
         address _usdc,
         address _priceFetcher,
@@ -205,8 +201,8 @@ contract USDCVault is
             "Invalid liquidation fee distribution"
         );
 
-        __Ownable_init(_owner);
         __ReentrancyGuard_init();
+        __Ownable_init(_owner);
         __Pausable_init();
         __UUPSUpgradeable_init();
 
