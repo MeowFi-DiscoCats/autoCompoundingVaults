@@ -119,14 +119,11 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         if (totalSupply() > 0) {
             exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
         }
-        // DO NOT reset exchange rate when totalSupply becomes 0
-        // This preserves accumulated interest for future depositors
-        // Only reset if no interest has ever been accrued (fresh start)
+        
         else if (!hasAccruedInterest) {
             exchangeRate = INITIAL_EXCHANGE_RATE;
         }
-        // If interest has been accrued but totalSupply = 0, keep the current exchange rate
-        // This ensures accumulated interest is preserved for future depositors
+     
     }
 
     // Burn PawUSDC tokens with redemption fee
@@ -161,14 +158,11 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         if (totalSupply() > 0) {
             exchangeRate = totalUnderlying.mulDiv(1e18, totalSupply(), Math.Rounding.Floor);
         }
-        // DO NOT reset exchange rate when totalSupply becomes 0
-        // This preserves accumulated interest and redemption fees for future depositors
-        // Only reset if no interest or redemption fees have ever been accrued (fresh start)
+    
         else if (!hasAccruedInterest && totalRedemptionFees == 0) {
             exchangeRate = INITIAL_EXCHANGE_RATE;
         }
-        // If interest or redemption fees have been accrued but totalSupply = 0, keep the current exchange rate
-        // This ensures accumulated value is preserved for future depositors
+     
         
         emit RedemptionFeeCollected(redemptionFee, exchangeRate, block.timestamp);
     }

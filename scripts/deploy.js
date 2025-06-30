@@ -1,11 +1,13 @@
 // const { ethers } = require("hardhat");
 const { ethers, upgrades } = require("hardhat");
-require('@openzeppelin/hardhat-upgrades');
 
 async function main() {
   const [deployer] = await ethers.getSigners();
   console.log("Deploying contracts with the account:", deployer.address);
-  console.log("Account balance:", (await ethers.provider.getBalance(deployer.address)).toString());
+  console.log(
+    "Account balance:",
+    (await ethers.provider.getBalance(deployer.address)).toString()
+  );
 
   // Contract addresses from PawUSDC.sol comments
   const USDC_ADDRESS = "0xf817257fed379853cDe0fa4F97AB987181B1E5Ea";
@@ -17,7 +19,7 @@ async function main() {
   const PRICE_FETCHER_ADDRESS = "0x85931b62e078AeBB4DeADf841be5592491C2efb7";
   const OCTO_ROUTER_ADDRESS = "0xb6091233aAcACbA45225a2B2121BBaC807aF4255";
 
-  // Configuration values from PawUSDC.sol comments
+  // Configuration values
   const CONFIG = {
     maxLTV: 7000, // 70%
     liquidationThreshold: 7500, // 75%
@@ -36,52 +38,50 @@ async function main() {
   };
 
   try {
-    // 1. Deploy and Initialize PawUSDC
-    console.log("\n1. Deploying and Initializing PawUSDC...");
+    // 1. Deploy and Initialize PawUSDC as ERC-1967 Proxy
+    console.log("\n1. Deploying and Initializing PawUSDC as ERC-1967 Proxy...");
     const PawUSDC = await ethers.getContractFactory("PawUSDC");
-    const pawUSDC = await PawUSDC.deploy();
+
+    // Deploy PawUSDC as upgradeable proxy
+    const pawUSDC = await upgrades.deployProxy(PawUSDC, [USDC_ADDRESS]);
     await pawUSDC.waitForDeployment();
-    console.log("PawUSDC deployed to:", await pawUSDC.getAddress());
+    console.log(
+      "✅ PawUSDC (ERC-1967 Proxy) deployed to:",
+      await pawUSDC.getAddress()
+    );
+    console.log("✅ PawUSDC initialized with USDC address:", USDC_ADDRESS);
 
-    // Initialize PawUSDC
-    await pawUSDC.initialize(USDC_ADDRESS);
-    console.log("PawUSDC initialized with USDC address:", USDC_ADDRESS);
+    // 2. Deploy Lending Pool (Upgradeable - for interest rate models and features)
+    console.log("\n2. Deploying CentralizedLendingPool as ERC-1967 Proxy...");
+    const CentralizedLendingPool = await ethers.getContractFactory(
+      "CentralizedLendingPool"
+    );
 
-    // 2. Deploy Lending Pool (simplified initialization)
-    console.log("\n2. Deploying CentralizedLendingPool...");
-    const CentralizedLendingPool = await ethers.getContractFactory("CentralizedLendingPool");
-    const lendingPool = await CentralizedLendingPool.deploy(
+    // Deploy lending pool as upgradeable proxy
+    const lendingPool = await upgrades.deployProxy(CentralizedLendingPool, [
       USDC_ADDRESS,
       await pawUSDC.getAddress(),
-      deployer.address // owner
-    );
+      deployer.address, // owner
+    ]);
     await lendingPool.waitForDeployment();
-    console.log("CentralizedLendingPool deployed to:", await lendingPool.getAddress());
+    console.log(
+      "✅ CentralizedLendingPool (ERC-1967 Proxy) deployed to:",
+      await lendingPool.getAddress()
+    );
 
     // Set borrowing pool in PawUSDC
     await pawUSDC.setBorrowingPool(await lendingPool.getAddress());
-    console.log("Set borrowing pool in PawUSDC:", await lendingPool.getAddress());
+    console.log(
+      "✅ Set borrowing pool in PawUSDC:",
+      await lendingPool.getAddress()
+    );
 
-    // 3. Deploy USDC Vault Implementation (for proxy pattern)
-    console.log("\n3. Deploying USDC Vault Implementation...");
+    // 3. Deploy USDC Vault as ERC-1967 Upgradeable Proxy
+    console.log("\n3. Deploying USDC Vault as ERC-1967 Upgradeable Proxy...");
     const USDCVault = await ethers.getContractFactory("USDCVault");
-    const usdcVaultImpl = await USDCVault.deploy();
-    await usdcVaultImpl.waitForDeployment();
-    console.log("USDC Vault Implementation deployed to:", await usdcVaultImpl.getAddress());
 
-    // 4. Deploy Factory
-    console.log("\n4. Deploying USDCVaultFactory...");
-    const USDCVaultFactory = await ethers.getContractFactory("USDCVaultFactory");
-    const usdcVaultFactory = await USDCVaultFactory.deploy(await usdcVaultImpl.getAddress());
-    await usdcVaultFactory.waitForDeployment();
-    console.log("USDCVaultFactory deployed to:", await usdcVaultFactory.getAddress());
-
-    // 5. Create Vault via Factory
-    console.log("\n5. Creating Vault via Factory...");
-    
-    // Create vault through factory with direct parameters
-    const createVaultTx = await usdcVaultFactory.createVault(
-      "USDC Vault", // name
+    // Deploy proxy with implementation
+    const vault = await upgrades.deployProxy(USDCVault, [
       USDC_ADDRESS,
       PRICE_FETCHER_ADDRESS,
       await pawUSDC.getAddress(),
@@ -99,19 +99,19 @@ async function main() {
       CONFIG.liquidationVaultShare,
       CONFIG.liquidationProtocolShare,
       CONFIG.liquidationLenderShare,
-      await lendingPool.getAddress()
-    );
-    const createVaultReceipt = await createVaultTx.wait();
-    
-    // Get the created vault address from the factory
-    const vaults = await usdcVaultFactory.getVaults();
-    const createdVaultAddress = vaults[0];
-    console.log("Vault created via factory at:", createdVaultAddress);
+      await lendingPool.getAddress(),
+    ]);
 
-    // 6. Register Vault in Lending Pool (with interest rate parameters)
-    console.log("\n6. Registering Vault in Lending Pool...");
+    await vault.waitForDeployment();
+    console.log(
+      "✅ USDC Vault (ERC-1967 Proxy) deployed to:",
+      await vault.getAddress()
+    );
+
+    // 4. Register Vault in Lending Pool (with interest rate parameters)
+    console.log("\n4. Registering Vault in Lending Pool...");
     await lendingPool.registerVault(
-      createdVaultAddress,
+      await vault.getAddress(),
       CONFIG.baseRate,
       CONFIG.multiplier,
       CONFIG.jumpMultiplier,
@@ -120,115 +120,204 @@ async function main() {
       CONFIG.vaultFeeRate,
       CONFIG.protocolFeeRate
     );
-    console.log("Vault registered in lending pool with interest rate configuration");
+    console.log(
+      "✅ Vault registered in lending pool with interest rate configuration"
+    );
 
-    // 7. Set up additional configurations for the created vault
-    console.log("\n7. Setting up additional configurations...");
-    
-    // Get the vault instance
-    const createdVault = await ethers.getContractAt("USDCVault", createdVaultAddress);
-    
+    // 5. Set up additional configurations for the vault
+    console.log("\n5. Setting up additional configurations...");
+
     // Check vault ownership
-    const vaultOwner = await createdVault.owner();
-    console.log("Vault owner:", vaultOwner);
-    console.log("Deployer address:", deployer.address);
-    
+    const vaultOwner = await vault.owner();
+    console.log("✅ Vault owner:", vaultOwner);
+    console.log("✅ Deployer address:", deployer.address);
+
     if (vaultOwner === deployer.address) {
       // Set fee recipients
-      await createdVault.setProtocolFeeRecipient(deployer.address);
-      await createdVault.setVaultFeeRecipient(deployer.address);
-      console.log("Set fee recipients in created vault");
+      await vault.setProtocolFeeRecipient(deployer.address);
+      await vault.setVaultFeeRecipient(deployer.address);
+      await vault.setVaultHardcodedYield(1200);
+      await vault.setLiquidationsPaused(false);
+      await vault.setBorrowingPaused(false);
+      await vault.setLiquidationEnabled(true);
+      console.log("✅ Set fee recipients in vault");
     } else {
-      console.log("⚠️  Vault is not owned by deployer. Fee recipients cannot be set automatically.");
-      console.log("You may need to transfer ownership or set fee recipients manually.");
+      console.log(
+        "⚠️  Vault is not owned by deployer. Fee recipients cannot be set automatically."
+      );
+      console.log(
+        "You may need to transfer ownership or set fee recipients manually."
+      );
     }
 
-    // 8. Print deployment summary
+    // 6. Print deployment summary
     console.log("\n=== DEPLOYMENT SUMMARY ===");
     console.log("Network:", network.name);
     console.log("Deployer:", deployer.address);
     console.log("\nContract Addresses:");
-    console.log("PawUSDC:", await pawUSDC.getAddress());
-    console.log("CentralizedLendingPool:", await lendingPool.getAddress());
-    console.log("USDC Vault Implementation:", await usdcVaultImpl.getAddress());
-    console.log("USDCVaultFactory:", await usdcVaultFactory.getAddress());
-    console.log("Created Vault (Proxy):", createdVaultAddress);
-    
+    console.log("✅ PawUSDC (ERC-1967 Proxy):", await pawUSDC.getAddress());
+    console.log(
+      "✅ CentralizedLendingPool (ERC-1967 Proxy):",
+      await lendingPool.getAddress()
+    );
+    console.log("✅ USDC Vault (ERC-1967 Proxy):", await vault.getAddress());
+
     console.log("\nConfiguration:");
-    console.log("Max LTV:", CONFIG.maxLTV / 100, "%");
-    console.log("Liquidation Threshold:", CONFIG.liquidationThreshold / 100, "%");
-    console.log("Liquidation Penalty:", CONFIG.liquidationPenalty / 100, "%");
-    console.log("Slippage BPS:", CONFIG.slippageBPS);
-    console.log("Protocol Fee Rate:", CONFIG.protocolFeeRate / 100, "%");
-    console.log("Vault Fee Rate:", CONFIG.vaultFeeRate / 100, "%");
+    console.log("✅ Max LTV:", CONFIG.maxLTV / 100, "%");
+    console.log(
+      "✅ Liquidation Threshold:",
+      CONFIG.liquidationThreshold / 100,
+      "%"
+    );
+    console.log(
+      "✅ Liquidation Penalty:",
+      CONFIG.liquidationPenalty / 100,
+      "%"
+    );
+    console.log("✅ Slippage BPS:", CONFIG.slippageBPS);
+    console.log("✅ Protocol Fee Rate:", CONFIG.protocolFeeRate / 100, "%");
+    console.log("✅ Vault Fee Rate:", CONFIG.vaultFeeRate / 100, "%");
 
-    console.log("\nExternal Addresses:");
-    console.log("USDC:", USDC_ADDRESS);
-    console.log("Token A (SHMON):", TOKEN_A_ADDRESS);
-    console.log("Token B (WMON):", TOKEN_B_ADDRESS);
-    console.log("Bubble Vault:", BUBBLE_VAULT_ADDRESS);
-    console.log("Bubble Router:", BUBBLE_ROUTER_ADDRESS);
-    console.log("LP Token:", LP_TOKEN_ADDRESS);
-    console.log("Price Fetcher:", PRICE_FETCHER_ADDRESS);
-    console.log("Octo Router:", OCTO_ROUTER_ADDRESS);
-
-    console.log("\nDeployment completed successfully!");
-
+    console.log("\n🎉 Deployment completed successfully!");
   } catch (error) {
-    console.error("Deployment failed:", error);
+    console.error("❌ Deployment failed:", error);
     throw error;
   }
 }
 
-async function deployUsdcVaultV2() {
+async function upgradeToV2() {
   const [deployer] = await ethers.getSigners();
-  console.log("Deploying UsdcVaultV2 with the account:", deployer.address);
-  console.log("Account balance:", (await ethers.provider.getBalance(deployer.address)).toString());
+  console.log("Upgrading vault to V2 with account:", deployer.address);
 
-  // Get the existing USDC vault proxy address
-  const existingVaultAddress = "0x822b50B9dA2D347569E0a2946dB5eC6bF8C38303";
-  
-  // Get the vault contract with the full interface including upgradeTo
-  const UsdcVault = await ethers.getContractFactory("USDCVault");
-  const usdcVault = UsdcVault.attach(existingVaultAddress);
-  
-  console.log("Existing UsdcVault address:", existingVaultAddress);
+  try {
+    // Get the existing vault proxy address (replace with your actual address)
+    const vaultProxyAddress = "0xa91af9826C270283E83b217114e04e5642f70b02"; // Replace with your vault proxy address
 
-  // Deploy the new implementation
-  const UsdcVaultV2 = await ethers.getContractFactory("UsdcVaultV2");
-  // const usdcVaultV2 = await UsdcVaultV2.deploy();
-  // await usdcVaultV2.waitForDeployment();
-  // console.log("UsdcVaultV2 deployed to:", await usdcVaultV2.getAddress());
+    // if (vaultProxyAddress === "0xa91af9826C270283E83b217114e04e5642f70b02") {
+    //   console.log("❌ Please replace vaultProxyAddress with your actual vault proxy address");
+    //   return;
+    // }
 
-  // Upgrade the proxy to point to the new implementation
-  
-  const upgraded = await upgrades.upgradeProxy(existingVaultAddress, UsdcVaultV2);
+    console.log("1. Deploying V2 implementation...");
+    const UsdcVaultV2 = await ethers.getContractFactory("UsdcVaultV2");
 
-  console.log(upgraded)
- 
+    console.log("2. Upgrading proxy to V2...");
+    const upgradedVault = await upgrades.upgradeProxy(
+      vaultProxyAddress,
+      UsdcVaultV2
+    );
+    console.log("✅ Proxy upgraded to V2");
 
-  // Test the new functionality
-  console.log("Testing new V2 functionality...");
-  const setNumberTx = await usdcVault.setNumber(100);
-  await setNumberTx.wait();
-  console.log("Number set to:", 100);
+    console.log("3. Testing V2 functionality...");
+    const testNumber = 42;
+    const setNumberTx = await upgradedVault.setNumber(testNumber);
+    await setNumberTx.wait();
+    console.log("✅ Number set to:", testNumber);
 
-  const number = await usdcVault.number();
-  console.log("Number retrieved:", number.toString());
-  
-  console.log("Upgrade and testing completed successfully!");
+    const number = await upgradedVault.number();
+    console.log("✅ Number retrieved:", number.toString());
+
+    console.log("\n🎉 V2 upgrade completed successfully!");
+    console.log("✅ Vault address:", vaultProxyAddress);
+    console.log("✅ New implementation: UsdcVaultV2");
+  } catch (error) {
+    console.error("❌ V2 upgrade failed:", error);
+    throw error;
+  }
 }
 
-// main()
-//   .then(() => process.exit(0))
-//   .catch((error) => {
-//     console.error(error);
-//     process.exit(1);
-//   });
-  
-  deployUsdcVaultV2()
+async function verifyV2Functionality() {
+  const [deployer] = await ethers.getSigners();
+  console.log("Verifying V2 functionality with account:", deployer.address);
+
+  try {
+    // Vault proxy address from deployment
+    const vaultProxyAddress = "0xa91af9826C270283E83b217114e04e5642f70b02";
+
+    console.log("1. Connecting to vault at:", vaultProxyAddress);
+
+    // Test with both V1 and V2 interfaces
+    console.log("\n2. Testing V1 functions (inherited)...");
+    const vaultV1 = await ethers.getContractAt("USDCVault", vaultProxyAddress);
+
+    // V1 functions
+    const owner = await vaultV1.owner();
+    console.log("✅ V1 - Vault owner:", owner);
+
+    const totalLiquidated = await vaultV1.totalLiquidatedUSDC();
+    console.log("✅ V1 - Total liquidated USDC:", totalLiquidated.toString());
+
+    const config = await vaultV1.config();
+    console.log("✅ V1 - Max LTV:", config.maxLTV.toString());
+    console.log(
+      "✅ V1 - Liquidation Threshold:",
+      config.liquidationThreshold.toString()
+    );
+
+    // Test V2 functions
+    console.log("\n3. Testing V2 functions (new)...");
+    const vaultV2 = await ethers.getContractAt(
+      "UsdcVaultV2",
+      vaultProxyAddress
+    );
+
+    // V2 functions
+    const currentNumber = await vaultV2.number();
+    console.log("✅ V2 - Current number:", currentNumber.toString());
+
+    // Set a new number
+    const newNumber = 999;
+    console.log("4. Setting number to:", newNumber);
+    const setNumberTx = await vaultV2.setNumber(newNumber);
+    await setNumberTx.wait();
+    console.log("✅ Number set successfully");
+
+    // Verify the number was set
+    const updatedNumber = await vaultV2.number();
+    console.log("✅ V2 - Updated number:", updatedNumber.toString());
+
+    // Test that V1 functions still work with V2 interface
+    console.log("\n5. Testing V1 functions through V2 interface...");
+    const ownerV2 = await vaultV2.owner();
+    console.log("✅ V2 interface - Vault owner:", ownerV2);
+
+    const totalLiquidatedV2 = await vaultV2.totalLiquidatedUSDC();
+    const configV2 = await vaultV2.config();
+    console.log(
+      "✅ V2 interface - Total liquidated USDC:",
+      totalLiquidatedV2.toString()
+    );
+    console.log("✅ V2 interface - Config:", configV2);
+
+    console.log("\n🎉 Verification completed!");
+    console.log("✅ Vault address:", vaultProxyAddress);
+    console.log("✅ V1 functions: WORKING (inherited)");
+    console.log("✅ V2 functions: WORKING (new)");
+    console.log("✅ All functions available through V2 interface");
+  } catch (error) {
+    console.error("❌ V2 verification failed:", error);
+    throw error;
+  }
+}
+
+// Uncomment the function you want to run
+main()
   .then(() => process.exit(0))
   .catch((error) => {
     console.error(error);
     process.exit(1);
   });
+
+// upgradeToV2()
+//   .then(() => process.exit(0))
+//   .catch((error) => {
+//     console.error(error);
+//     process.exit(1);
+//   });
+
+// verifyV2Functionality()
+//   .then(() => process.exit(0))
+//   .catch((error) => {
+//     console.error(error);
+//     process.exit(1);
+//   });

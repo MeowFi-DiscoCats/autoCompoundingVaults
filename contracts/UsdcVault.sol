@@ -395,9 +395,9 @@ contract USDCVault is
         );
         
         // ✅ FIXED: Calculate available borrowing capacity correctly
-        uint256 existingDebt = totalBorrowAmount - borrowAmount; // Remove new borrow to get existing debt
-        uint256 availableBorrowCapacity = existingDebt < maxBorrowAmount 
-            ? maxBorrowAmount - existingDebt 
+        uint256 prevDebt = totalBorrowAmount - borrowAmount; // Remove new borrow to get existing debt
+        uint256 availableBorrowCapacity = prevDebt < maxBorrowAmount 
+            ? maxBorrowAmount - prevDebt 
             : 0;
         
         // ✅ FIXED: Check if new borrow amount exceeds available borrowing capacity
@@ -552,13 +552,7 @@ contract USDCVault is
 
     function liquidate(
         address borrower
-    )
-        external
-        nonReentrant
-        notLiquidationsPaused
-        onlyActiveBorrower(borrower)
-        notInEmergencyMode
-    {
+    ) public nonReentrant notLiquidationsPaused onlyActiveBorrower(borrower) notInEmergencyMode {
         require(liquidationEnabled, "Liquidation is disabled");
         require(config.active, "Vault not active");
 
@@ -649,7 +643,7 @@ contract USDCVault is
 
         // FIXED: Repay to centralized pool - transfer first, then call repay
         if (principalRepaid > 0) {
-            usdc.safeTransfer(address(lendingPool), principalRepaid);
+            usdc.safeTransfer(address(pawUSDC), principalRepaid);
             lendingPool.repay(address(this), principalRepaid);
         }
 
@@ -1307,6 +1301,154 @@ contract USDCVault is
             : 0;
         
         return (totalCollateralValue, maxBorrowAmount, currentDebt, availableBorrowCapacity);
+    }
+
+    /// @notice Gelato checker for batch liquidation (up to 5 borrowers)
+    function checker()
+        external
+        view
+        returns (bool canExec, bytes memory execPayload)
+    {
+        // Get liquidatable positions (max 5 for gas efficiency)
+        address[] memory liquidatablePositions = getLiquidatablePositions(5);
+
+        if (liquidatablePositions.length > 0) {
+            // Prepare execution data for batch liquidation
+            execPayload = abi.encodeWithSelector(
+                this.liquidateMultiple.selector,
+                liquidatablePositions
+            );
+            canExec = true;
+        } else {
+            canExec = false;
+            execPayload = bytes("");
+        }
+    }
+
+    /// @notice Gelato checker for single liquidation
+    function checkerSingle()
+        external
+        view
+        returns (bool canExec, bytes memory execPayload)
+    {
+        address liquidatablePosition = getFirstLiquidatablePosition();
+
+        if (liquidatablePosition != address(0)) {
+            execPayload = abi.encodeWithSelector(
+                this.liquidate.selector,
+                liquidatablePosition
+            );
+            canExec = true;
+        } else {
+            canExec = false;
+            execPayload = bytes("");
+        }
+    }
+
+    /// @notice Get up to maxPositions liquidatable borrowers
+    function getLiquidatablePositions(uint256 maxPositions)
+        public
+        view
+        returns (address[] memory liquidatable)
+    {
+        if (!liquidationEnabled || activeBorrowers.length == 0) {
+            return new address[](0);
+        }
+
+        address[] memory temp = new address[](maxPositions);
+        uint256 count = 0;
+
+        for (
+            uint256 i = 0;
+            i < activeBorrowers.length && count < maxPositions;
+            i++
+        ) {
+            address borrower = activeBorrowers[i];
+            BorrowerPosition storage position = borrowers[borrower];
+
+            if (position.isActive && !_isHealthy(borrower, true)) {
+                temp[count] = borrower;
+                count++;
+            }
+        }
+
+        liquidatable = new address[](count);
+        for (uint256 i = 0; i < count; i++) {
+            liquidatable[i] = temp[i];
+        }
+    }
+
+    /// @notice Get first liquidatable position (for single liquidation strategy)
+    /// @return borrower Address of first liquidatable borrower, or address(0) if none
+    function getFirstLiquidatablePosition()
+        public
+        view
+        returns (address borrower)
+    {
+        if (!liquidationEnabled || activeBorrowers.length == 0) {
+            return address(0);
+        }
+
+        for (uint256 i = 0; i < activeBorrowers.length; i++) {
+            address currentBorrower = activeBorrowers[i];
+            BorrowerPosition storage position = borrowers[currentBorrower];
+
+            if (position.isActive && !_isHealthy(currentBorrower, true)) {
+                return currentBorrower;
+            }
+        }
+
+        return address(0);
+    }
+
+    /// @notice Get the number of liquidatable borrowers
+    function getLiquidatableCount() external view returns (uint256 count) {
+        if (!liquidationEnabled) return 0;
+
+        for (uint256 i = 0; i < activeBorrowers.length; i++) {
+            address borrower = activeBorrowers[i];
+            BorrowerPosition storage position = borrowers[borrower];
+
+            if (position.isActive && !_isHealthy(borrower, true)) {
+                count++;
+            }
+        }
+    }
+
+    /// @notice Returns true if any liquidations are needed (checks up to 10 borrowers)
+    function liquidationsNeeded() external view returns (bool needed) {
+        if (!liquidationEnabled || activeBorrowers.length == 0) {
+            return false;
+        }
+
+        uint256 checkLimit = activeBorrowers.length > 10
+            ? 10
+            : activeBorrowers.length;
+
+        for (uint256 i = 0; i < checkLimit; i++) {
+            address borrower = activeBorrowers[i];
+            BorrowerPosition storage position = borrowers[borrower];
+
+            if (position.isActive && !_isHealthy(borrower, true)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// @notice Batch liquidate multiple borrowers in a single transaction
+    /// @param toLiquidate Array of borrower addresses to liquidate
+    function liquidateMultiple(address[] calldata toLiquidate) external {
+        uint256 len = toLiquidate.length;
+        require(len > 0, "No borrowers provided");
+        for (uint256 i = 0; i < len; i++) {
+            address borrower = toLiquidate[i];
+            // Only liquidate if still active and unhealthy
+            if (borrowers[borrower].isActive && !_isHealthy(borrower, true)) {
+                liquidate(borrower);
+            }
+        }
     }
 
 }
