@@ -35,4 +35,5 @@ interface IPawUSDC {
     function lastUpdateTime() external view returns (uint256);
     function totalRedemptionFees() external view returns (uint256);
     function getTotalRedemptionFees() external view returns (uint256);
+    function repayPrincipal(uint256 amount) external;
 } 

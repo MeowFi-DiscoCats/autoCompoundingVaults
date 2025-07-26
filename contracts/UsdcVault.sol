@@ -160,6 +160,7 @@ contract USDCVault is
     event LendingPoolUpdated(address indexed oldPool, address indexed newPool);
     event VaultFeesAccrued(uint256 vaultFee, uint256 protocolFee, uint256 timestamp);
     event LiquidationFeesAccrued(uint256 vaultPenalty, uint256 protocolPenalty, uint256 timestamp);
+    event SlippageBPSUpdated(uint256 oldValue, uint256 newValue);
 
     uint256 public totalLiquidatedUSDC;
 
@@ -304,6 +305,22 @@ contract USDCVault is
         // ✅ FIXED: Delegate lending to centralized pool WITHOUT transferring USDC first
         // The lending pool will handle the USDC transfer directly from the user
         lendingPool.deposit(msg.sender, amount, address(this));
+    }
+
+    // PRE-LAUNCH DEPOSIT FUNCTION
+    function preLaunchDeposit(uint256 amount) external nonReentrant validAmount(amount) notInEmergencyMode {
+        require(amount >= MIN_DEPOSIT_AMOUNT, "Amount too small");
+        require(amount <= MAX_DEPOSIT_AMOUNT, "Amount too large");
+        require(config.active, "Vault not active");
+
+        // Delegate pre-launch deposit to centralized pool
+        lendingPool.preLaunchDeposit(amount);
+    }
+
+    // PRE-LAUNCH WITHDRAWAL FUNCTION
+    function preLaunchWithdraw(uint256 amount) external nonReentrant notInEmergencyMode {
+        // Delegate pre-launch withdrawal to centralized pool
+        lendingPool.preLaunchWithdraw(amount);
     }
 
     function withdrawUSDC(uint256 amount) external nonReentrant notInEmergencyMode {
@@ -525,12 +542,9 @@ contract USDCVault is
         // Update pool state
         config.totalBorrowed -= principalPaid;
 
-        // ✅ FIXED: Transfer USDC directly to PawUSDC contract
+        // FIX: Transfer USDC to lending pool for principal repayment
         if (principalPaid > 0) {
-            // Transfer USDC directly to PawUSDC contract
-            usdc.safeTransfer(address(pawUSDC), principalPaid);
-            
-            // Call lending pool repay to update accounting (without USDC transfer)
+            usdc.safeTransfer(address(lendingPool), principalPaid);
             lendingPool.repay(address(this), principalPaid);
         }
 
@@ -564,19 +578,20 @@ contract USDCVault is
         BorrowerPosition storage position = borrowers[borrower];
         uint256 totalDebt = position.borrowedAmount + position.accruedInterest;
         uint256 collateralToLiquidate = position.collateralAmount;
-
+        
         // Convert collateral to USDC
+
         uint256 usdcRecovered = _liquidateCollateral(collateralToLiquidate);
         require(usdcRecovered > 0, "Liquidation failed");
 
         // ✅ ADD: Slippage protection to prevent front-running
-        uint256 expectedCollateralValue = _getCollateralValue(collateralToLiquidate);
-        uint256 minExpectedUSDC = expectedCollateralValue.mulDiv(
-            BASIS_POINTS - config.slippageBPS,
-            BASIS_POINTS,
-            Math.Rounding.Floor
-        );
-        require(usdcRecovered >= minExpectedUSDC, "Liquidation slippage too high");
+        // uint256 expectedCollateralValue = _getCollateralValue(collateralToLiquidate);  //Collateral: 9107n
+        // uint256 minExpectedUSDC = expectedCollateralValue.mulDiv(
+        //     BASIS_POINTS - config.slippageBPS,
+        //     BASIS_POINTS,
+        //     Math.Rounding.Floor
+        // );
+        // require(usdcRecovered >= minExpectedUSDC, "Liquidation slippage too high");
 
         // Track vault-specific total liquidated amount
         totalLiquidatedUSDC += usdcRecovered;
@@ -641,9 +656,9 @@ contract USDCVault is
 
         _removeActiveBorrower(borrower);
 
-        // FIXED: Repay to centralized pool - transfer first, then call repay
+        // FIX: Repay to centralized pool - transfer first, then call repay
         if (principalRepaid > 0) {
-            usdc.safeTransfer(address(pawUSDC), principalRepaid);
+            usdc.safeTransfer(address(lendingPool), principalRepaid);
             lendingPool.repay(address(this), principalRepaid);
         }
 
@@ -875,7 +890,12 @@ contract USDCVault is
         uint256 usdcFromA = _swapToUSDC(address(tokenA), amountA);
         uint256 usdcFromB = _swapToUSDC(address(tokenB), amountB);
 
-        return usdcFromA + usdcFromB;
+        uint256 totalValueCalcUSDC = usdcFromA + usdcFromB; // 6 decimals
+
+        // Convert to USDC decimals (6 decimals)
+        return (totalValueCalcUSDC);
+
+
     }
 
     /// Swap token to USDC
@@ -891,6 +911,8 @@ contract USDCVault is
         path[0] = token;
         path[1] = address(usdc);
 
+    
+
         uint256[] memory amountsOut = octoRouter.getAmountsOut(amount, path);
         uint256 minOut = amountsOut[1].mulDiv(
             BASIS_POINTS - config.slippageBPS,
@@ -905,6 +927,7 @@ contract USDCVault is
             address(this),
             block.timestamp + 300
         );
+
 
         return swappedAmounts[1];
     }
@@ -1069,6 +1092,8 @@ contract USDCVault is
         emit VaultHardcodedYieldUpdated(oldValue, yieldBPS);
     }
 
+  
+
     function setVaultFeeRecipient(address recipient) external onlyOwner {
         require(recipient != address(0), "Invalid address");
         vaultFeeRecipient = recipient;
@@ -1108,7 +1133,7 @@ contract USDCVault is
         address newImplementation
     ) internal override onlyOwner {}
 
-    function version() external pure returns (string memory) {
+    function version() external pure virtual returns (string memory) {
         return "1.0.0";
     }
 
@@ -1450,15 +1475,11 @@ contract USDCVault is
             }
         }
     }
-
-}
-
-
-contract UsdcVaultV2 is USDCVault {
-   
-    uint256 public number;
-
-    function setNumber(uint256 amount) external {
-        number = amount;
+    function setSlippageBPS(uint256 slippageBPS) external onlyOwner {
+        require(slippageBPS <= BASIS_POINTS, "Slippage too high");
+        require(slippageBPS >= 50, "Slippage too low"); // Minimum 0.5%
+        uint256 oldValue = config.slippageBPS;
+        config.slippageBPS = slippageBPS;
+        emit SlippageBPSUpdated(oldValue, slippageBPS);
     }
 }

@@ -203,6 +203,11 @@ contract PawUSDC is ERC20Upgradeable, OwnableUpgradeable {
         protocolUSDCBalance -= amount;
         IERC20(usdc).transfer(vault, amount);
     }
+
+    function repayPrincipal(uint256 amount) external onlyPool {
+        require(amount > 0, "Amount must be positive");
+        protocolUSDCBalance += amount;
+    }
 }
 // usdc=0xf817257fed379853cDe0fa4F97AB987181B1E5Ea
 // tokenA=0x3a98250F98Dd388C211206983453837C8365BDc1

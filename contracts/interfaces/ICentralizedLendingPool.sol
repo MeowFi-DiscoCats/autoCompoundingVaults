@@ -85,4 +85,27 @@ interface ICentralizedLendingPool {
      * @return Total interest distributed
      */
     function getTotalInterestDistributed() external view returns (uint256);
+
+    // PRE-LAUNCH FUNCTIONS
+    /**
+     * @dev Deposit USDC before launch (no PawUSDC minted yet)
+     * @param amount Amount of USDC to deposit
+     */
+    function preLaunchDeposit(uint256 amount) external;
+
+    /**
+     * @dev Withdraw USDC before launch
+     * @param amount Amount of USDC to withdraw
+     */
+    function preLaunchWithdraw(uint256 amount) external;
+
+    /**
+     * @dev Activate the launch (only owner)
+     */
+    function activateLaunch() external;
+
+    /**
+     * @dev Process pre-launch deposits after launch
+     */
+    function processPreLaunchDeposits() external;
 } 
